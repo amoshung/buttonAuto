@@ -308,12 +308,14 @@ class FloatingOverlayApp:
             top = tk.Frame(row, bg=row_bg)
             top.pack(fill="x")
             more = f"（{len(g)} 個視窗）" if len(g) > 1 else ""
-            self_mark = "　🛡 助理本身" if contains_assistant(w.path, w.remote) else ""
+            self_mark = "　🛡 助理本身（不提供）" if contains_assistant(w.path, w.remote) else ""
             tk.Label(top, text=f"{w.app_label}｜{w.project}{more}{self_mark}", bg=row_bg,
                      fg="#F8FAFC" if mode != "off" else "#94A3B8", font=FONT_B).pack(side="left")
             _button(top, "前往", lambda h=w.hwnd: wu.activate_window(h)).pack(side="right")
             _button(top, "詳情", lambda pw=w: self._open_session_dialog(pw), bg="#7C3AED").pack(side="right", padx=4)
-            mode_cb = ttk.Combobox(top, values=list(MODE_TEXT.values()), state="readonly", width=8, font=FONT_S)
+            is_self = contains_assistant(w.path, w.remote)
+            mode_cb = ttk.Combobox(top, values=list(MODE_TEXT.values()), state="disabled" if is_self else "readonly",
+                                   width=8, font=FONT_S)
             mode_cb.set(MODE_TEXT[self.cfg.mode_of(key)])
             mode_cb.pack(side="right", padx=2)
             mode_cb.bind("<<ComboboxSelected>>", lambda _e, k=key, cb=mode_cb, pw=w: self._on_session_mode(k, cb, pw))
@@ -363,13 +365,12 @@ class FloatingOverlayApp:
 
     def _on_session_mode(self, key: str, cb: ttk.Combobox, pw: ProjectWindow) -> None:
         mode = {v: k for k, v in MODE_TEXT.items()}.get(cb.get(), "off")
-        if mode == "auto" and contains_assistant(pw.path, pw.remote):
-            ok = messagebox.askyesno(
-                "確認", "這個視窗開的是 AI 工程助理自己的專案。\n\n如果你在這個視窗的對話裡調整助理，"
-                "自動駕駛會替你代按確認、打字進同一個對話，造成干擾。\n\n確定要開自動駕駛嗎？", parent=self.root)
-            if not ok:
-                cb.set(MODE_TEXT[self.cfg.mode_of(key)])
-                return
+        if mode != "off" and contains_assistant(pw.path, pw.remote):
+            messagebox.showinfo("無法啟用", "這個視窗開的是 AI 工程助理自己的專案，助理不會在這裡建議或自動駕駛，"
+                                "以免干擾你調整助理的那個對話。", parent=self.root)
+            cb.set(MODE_TEXT["off"])
+            self.set_session_mode(key, "off")
+            return
         self.set_session_mode(key, mode)
         if mode == "auto":
             st = self.worker.store.get(pw.key, pw.app_label, pw.project, pw.path, pw.remote).load()
@@ -665,6 +666,11 @@ class FloatingOverlayApp:
     def _migrate_session_modes(self) -> None:
         """舊設定（勾選＋詳情裡的自動駕駛開關）轉成新的單一模式；助理自己的專案一律從「關閉」開始。"""
         changed = False
+        for s in self.worker.store.all():  # 助理本身的專案一律關閉（含先前已設定的）
+            st = s.load()
+            if st.key and contains_assistant(st.path, st.remote) and self.cfg.mode_of(st.key) != "off":
+                self.cfg.set_mode(st.key, "off")
+                changed = True
         for key in list(self.cfg.authorized_sessions):
             if key in self.cfg.session_modes:
                 continue
@@ -1178,6 +1184,8 @@ class SessionDialog:
         mode = self.app.cfg.mode_of(self.pw.key)
         self.mode_cb.set(MODE_TEXT[mode])
         notes = []
+        if st.chat_title:
+            notes.append(f"綁定的對話：{st.chat_title}")
         doing = st.current_task or st.status_summary
         if doing:
             notes.append(f"代理目前在做：{doing}")

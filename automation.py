@@ -28,7 +28,7 @@ import win_utils as wu
 from ai_client import AIError, DecisionClient, LLMDecisionClient, VisionClient, extract_json
 from ai_settings import AISettings
 from config import AppConfig
-from projects import ProjectDetector, ProjectWindow
+from projects import ProjectDetector, ProjectWindow, contains_assistant
 import driver as drv
 import driver_p2 as drv2
 import verifier
@@ -225,6 +225,34 @@ def decide_plan(
         return Plan("reply", "AI 理解後回覆", scores=scores)
 
     return Plan("ask_human", f"無法判讀的動作「{action}」", scores=scores)
+
+
+_APPROVAL_ANCHORS = ("Your approval is required", "Run Command", "wants to run", "requires approval", "Run command?")
+
+
+def approval_context(panel_text: str, max_chars: int = 2000) -> str:
+    """聊天面板裡最後一個「等允許」卡片的內容（UIA 原文，比視覺模型抄寫可靠）。"""
+    t = panel_text or ""
+    idx = max(t.rfind(a) for a in _APPROVAL_ANCHORS)
+    seg = t[idx:] if idx >= 0 else t[-max_chars:]
+    return seg[:max_chars]
+
+
+def salvage_vision(raw: str, panel_text: str, approvals: List[str]) -> Optional[Dict[str, Any]]:
+    """視覺模型的 JSON 壞掉（常見於照抄很長的指令）時，撈出能讀的欄位；畫面上有允許按鈕就用 UIA 原文補上指令。"""
+    def field_of(name: str) -> str:
+        m = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % name, raw or "")
+        return m.group(1) if m else ""
+
+    state = field_of("agent_state")
+    if approvals:
+        return {"agent_state": "waiting_approval", "summary": field_of("summary") or "代理在等允許",
+                "pending_request": field_of("pending_request"), "command": approval_context(panel_text),
+                "action_buttons": approvals, "options": []}
+    if state:
+        return {"agent_state": state, "summary": field_of("summary"), "pending_request": field_of("pending_request"),
+                "command": "", "action_buttons": [], "options": []}
+    return None
 
 
 def crop_to_panel(rgb, hwnd: int, panel_rect) -> Any:
@@ -594,7 +622,8 @@ class AutomationWorker(threading.Thread):
     def _watched_windows(self) -> List[ProjectWindow]:
         """只回傳使用者勾選的工作階段視窗（Kiro / Antigravity，且要辨識得出專案）。"""
         allowed = set(self.cfg.authorized_sessions)
-        return [p for p in self.detector.detect() if p.project and p.key in allowed]
+        return [p for p in self.detector.detect()
+                if p.project and p.key in allowed and not contains_assistant(p.path, p.remote)]
 
     def _user_guard(self, w: Optional[ProjectWindow], typing: bool, by: str = "assistant") -> str:
         """會干擾使用者時回傳原因（不動手）；空字串代表可以動手。
@@ -610,8 +639,10 @@ class AutomationWorker(threading.Thread):
             return ""  # 代按不影響你在其他視窗的操作，不用等
         idle = wu.real_idle_seconds()
         need = float(self.cfg.ai_idle_sec)
-        if idle < need or wu.modifier_keys_down():
-            return f"你正在操作鍵盤或滑鼠（停止 {need:.0f} 秒後才會動作）"
+        if wu.modifier_keys_down():
+            return "你按著 Ctrl／Shift／Alt"
+        if idle < need:
+            return f"你 {idle:.1f} 秒前按過鍵盤或滑鼠（停手 {need:.0f} 秒後才打字；移動滑鼠不算）"
         if typing and w is not None and wu.get_foreground() == w.hwnd:
             return "你正在使用這個 IDE 視窗，打字會打斷你"
         return ""
@@ -1110,13 +1141,38 @@ class AutomationWorker(threading.Thread):
             self._drive_build(w, sess, snap, vs, panel_text, judge, specs, plans, candidates, h, base, record_props)
         self._maybe_autosend(w)
 
+    @staticmethod
+    def _chat_title(w) -> str:
+        try:
+            return ud.UiaWindow(w.hwnd).chat_title(w.app)
+        except Exception:
+            return ""
+
+    def _other_chat(self, w, chat: str) -> bool:
+        """目前顯示的不是目標綁定的那個對話：不操作，只提示。目標已達成時換了對話，當成新工作交給驅動器。"""
+        sess = self._session_for(w)
+        st = sess.load()
+        if not st.chat_title:
+            if st.goal:
+                sess.update(lambda s: setattr(s, "chat_title", chat))
+            return False
+        if st.chat_title == chat:
+            return False
+        if phase_of(st) == "done":
+            return False
+        self._session(w, f"↔ 目前顯示的是另一個對話「{chat[:30]}」；目標綁在「{st.chat_title[:30]}」，"
+                         "切回去才會繼續（或在詳情按「開始新目標」）")
+        return True
+
     def _drive_after_done(self, w, sess, snap, agent_state, panel_text, judge, specs, plans, candidates, h, base) -> None:
         """目標已達成之後：聊天內容有新進展（代理在做別的工作、在問你下一步），就準備新目標，而不是一直顯示「已達成」。"""
-        if not snap.done_hash:
+        chat = self._chat_title(w)
+        other_chat = bool(chat and snap.chat_title and chat != snap.chat_title)
+        if not snap.done_hash and not other_chat:
             sess.update(lambda s: (base(s), setattr(s, "done_hash", h)), specs, plans)
             self._session(w, "🎉 目標已達成並查核通過")
             return
-        if not h or h == snap.done_hash or agent_state == "working":
+        if not other_chat and (not h or h == snap.done_hash or agent_state == "working"):
             sess.update(base, specs, plans)
             self._session(w, "🎉 目標已達成並查核通過" + ("（代理在工作中）" if agent_state == "working" else ""))
             return
@@ -1127,7 +1183,7 @@ class AutomationWorker(threading.Thread):
         sess.history("new_work_detected", goal=g, task=task)
         if self.cfg.mode_of(w.key) == "auto" and g:
             # 自動駕駛：先採用推測的新目標繼續推進；驗收 spec 仍要你確認才會開始實作
-            new = sess.start_new_goal(g, source="inferred")
+            new = sess.start_new_goal(g, source="inferred", chat_title=chat)
 
             def note(s, task=task, doc=doc) -> None:
                 s.current_task = task
@@ -1468,6 +1524,9 @@ class AutomationWorker(threading.Thread):
         uw = ud.UiaWindow(w.hwnd)
         buttons = uw.buttons()
         inp = uw.chat_input()
+        chat = uw.chat_title(w.app)
+        if chat and self._other_chat(w, chat):
+            return
         panel = uw.panel_of(inp) if inp is not None else None
         panel_rect = ud.control_rect(panel) if panel is not None else None
         panel_text = uw.panel_text(panel) if panel is not None else ""
@@ -1505,10 +1564,14 @@ class AutomationWorker(threading.Thread):
         shot_png = wu.to_png(crop_to_panel(rgb, w.hwnd, panel_rect))
         raw = vision.chat(build_vision_prompt(app, panel_text), shot_png, max_tokens=2500)
         vs = extract_json(raw)
+        approvals_early = ud.approval_buttons(buttons, panel_rect)
         if vs is None:
-            self._log(f"⚠ [{app}] 視覺模型回覆不是 JSON：{raw[:80]!r}")
-            st.last_kind = "wait"
-            return
+            vs = salvage_vision(raw, panel_text, approvals_early)
+            if vs is None:
+                self._log(f"⚠ [{app}] 視覺模型回覆不是 JSON：{raw[:80]!r}")
+                st.last_kind = "wait"
+                return
+            self._log(f"🩹 [{app}] 視覺模型 JSON 不完整，改用可讀的欄位與 UIA 原文繼續")
         state = str(vs.get("agent_state", ""))
         summary = str(vs.get("summary", ""))
         approvals_now = ud.approval_buttons(buttons, panel_rect)

@@ -88,6 +88,7 @@ class SessionState:
     done_at: str = ""
     done_hash: str = ""      # 達成目標當下的聊天內容指紋；之後內容變了，代表代理在做新的工作
     goal_source: str = ""    # user / agent / inferred
+    chat_title: str = ""     # 目標綁定的聊天對話標題（同一個 IDE 視窗裡可能有很多對話分頁）
     # 對話過長、原地打轉
     sends_in_conversation: int = 0
     recent_tails: List[str] = field(default_factory=list)
@@ -376,7 +377,7 @@ class Session:
             self.save(st, specs, plans)
             return st
 
-    def start_new_goal(self, goal: str = "", source: str = "user") -> SessionState:
+    def start_new_goal(self, goal: str = "", source: str = "user", chat_title: str = "") -> SessionState:
         """封存目前的進度（state.json 與 progress.md 複製到 archive/），換成新的目標從頭開始。"""
         with self._lock:
             old = self.load()
@@ -392,6 +393,7 @@ class Session:
             new = SessionState(key=old.key, app=old.app, project=old.project, path=old.path, remote=old.remote,
                                repo_path=old.repo_path, active_docs=list(old.active_docs),
                                active_docs_by=old.active_docs_by)
+            new.chat_title = chat_title
             new.goal, new.goal_source = goal, source if goal else ""
             new.goal_confirmed_at = now_str() if goal else ""
             new.add_interaction("new_goal", f"封存 {stamp}，開始新目標：{goal[:100] or '（未設定）'}")

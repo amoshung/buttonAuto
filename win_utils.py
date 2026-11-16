@@ -227,6 +227,7 @@ def flash_window(hwnd: int, count: int = 5) -> None:
 
 # ---- 使用者真實輸入偵測（低階鍵盤／滑鼠掛鉤，能分辨使用者輸入與程式模擬的輸入） ----
 WH_KEYBOARD_LL, WH_MOUSE_LL = 13, 14
+WM_MOUSEMOVE = 0x0200
 LLKHF_INJECTED, LLMHF_INJECTED = 0x10, 0x01
 _LRESULT = ctypes.c_ssize_t
 _HOOKPROC = ctypes.WINFUNCTYPE(_LRESULT, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t)
@@ -281,7 +282,7 @@ class InputMonitor:
         return user32.CallNextHookEx(None, code, wparam, lparam)
 
     def _on_ms(self, code, wparam, lparam):
-        if code >= 0:
+        if code >= 0 and wparam != WM_MOUSEMOVE:
             info = ctypes.cast(lparam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
             if not info.flags & LLMHF_INJECTED:
                 self.last_real = time.monotonic()

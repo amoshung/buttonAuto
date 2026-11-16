@@ -79,7 +79,49 @@ class UiaWindow:
         self.control = auto.ControlFromHandle(hwnd)
 
     def window_rect(self) -> Rect:
-        return _rect(self.control)
+        r = _rect(self.control)
+        if r[2] - r[0] <= 0 or r[3] - r[1] <= 0:
+            # 有些視窗（例如 Antigravity）UIA 回報的大小是 0，改用 Win32
+            import win_utils as _wu
+            r = _wu.get_window_rect(self.hwnd)
+        return r
+
+    def chat_title(self, app: str) -> str:
+        """目前顯示的那個聊天對話的標題；讀不到時回傳空字串。
+
+        Kiro：聊天分頁（class 為 tab-bar-item）中被選取的那個。
+        Antigravity：聊天區頂端、「New Conversation」按鈕同一列的標題文字。
+        """
+        try:
+            if app == "kiro":
+                for c in _find_all(self.control, auto.PropertyId.ControlTypeProperty, auto.ControlType.TabItemControl):
+                    if "tab-bar-item" not in (c.ClassName or ""):
+                        continue
+                    try:
+                        if c.GetPattern(auto.PatternId.SelectionItemPattern).IsSelected:
+                            name = re.split(r"\s+Close\s+", c.Name or "", maxsplit=1)[0].strip()
+                            return _TAB_STATUS.sub("", name).strip()
+                    except Exception:
+                        continue
+                return ""
+            if app == "antigravity":
+                bs = self.buttons()
+                nc = pick_button(bs, "New Conversation")
+                if nc is None:
+                    return ""
+                left = max([b.rect[2] for b in bs if abs(b.rect[1] - nc.rect[1]) < 12 and b.rect[2] <= nc.rect[0]
+                            and name_in(b.name, ["Toggle Sidebar", "Search Conversations"])] or [nc.rect[0] - 500])
+                best = ""
+                for c in _find_all(self.control, auto.PropertyId.ControlTypeProperty, auto.ControlType.TextControl):
+                    r = _rect(c)
+                    t = (c.Name or "").strip()
+                    if t and abs(r[1] - nc.rect[1]) < 15 and left <= r[0] < nc.rect[0] and not _SYMBOLS.fullmatch(t):
+                        if len(t) > len(best):
+                            best = t
+                return best
+        except Exception:
+            return ""
+        return ""
 
     def buttons(self) -> List[ButtonInfo]:
         out: List[ButtonInfo] = []
@@ -317,6 +359,9 @@ def set_focus(control) -> bool:
     except Exception:
         return False
 
+
+# Kiro 會在對話分頁名稱前加上狀態字，比對對話時要去掉
+_TAB_STATUS = re.compile(r"^(Working|Needs your input|Needs input|Done|Error|Failed|Paused|Waiting)\s+", re.I)
 
 _PLACEHOLDERS = ("ask a question or describe a task", "ask anything, @ to mention")
 
