@@ -255,3 +255,27 @@ def test_after_done_new_work_suggest_mode_only_offers(tmp_path):
     w._drive(pw, stopped, "新的對話", judge)
     st = sess.load()
     assert st.goal == "舊目標" and st.suggested_action == "new_goal" and "U2" in st.agent_goal_proposal
+
+
+def test_notify_only_new_pending_items_rate_limited(tmp_path, monkeypatch):
+    import automation
+    sent = []
+    monkeypatch.setattr(automation.wu, "notify", lambda t, b, launch="": sent.append(b) or True)
+    monkeypatch.setattr(automation.wu, "get_foreground", lambda: 0)
+    w = _worker(tmp_path)
+    pw = ProjectWindow(7, "kiro", "Kiro", "t", "proj", "", str(tmp_path), False, False)
+    sess = w._session_for(pw)
+    sess.update(lambda st: st.pending_human.append("舊事項"))
+    w._notify_pending(pw)
+    assert sent == []  # 啟動時已存在的不通知
+    sess.update(lambda st: st.pending_human.append("確認驗收 spec"))
+    w._notify_pending(pw)
+    assert sent == ["確認驗收 spec"]
+    w._notify_pending(pw)
+    assert len(sent) == 1  # 同一事項不重複
+    sess.update(lambda st: st.pending_human.append("新的第二項"))
+    w._notify_pending(pw)
+    assert len(sent) == 1  # 60 秒內不再跳
+    w._notify_at[pw.key] -= 61
+    w._notify_pending(pw)
+    assert sent[-1] == "新的第二項"

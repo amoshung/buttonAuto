@@ -478,6 +478,9 @@ class FloatingOverlayApp:
         self.driver_var = tk.BooleanVar(value=self.cfg.driver_enabled)
         _check(parent, "驅動器：代理停下來時寫出建議的下一步（只建議，送出要你按）", self.driver_var,
                self._save_ai_settings).pack(anchor="w")
+        self.notify_var = tk.BooleanVar(value=self.cfg.notify_enabled)
+        _check(parent, "需要你決定、每日摘要產生時跳 Windows 通知", self.notify_var,
+               self._save_ai_settings).pack(anchor="w")
         srow = tk.Frame(parent, bg=BG)
         srow.pack(fill="x", pady=(2, 0))
         _label(srow, "每日摘要時間", font=FONT_S).pack(side="left")
@@ -488,8 +491,10 @@ class FloatingOverlayApp:
         se.bind("<Return>", lambda _e: self._save_ai_settings())
         _button(srow, "立即產生", self.worker.request_summary).pack(side="left", padx=2)
         _button(srow, "開啟資料夾", lambda: self._open_path(os.path.join(BASE_DIR, "reports"))).pack(side="left", padx=2)
-        self.summary_lbl = _label(parent, "", fg=FG_DIM, font=FONT_S)
+        self.summary_lbl = _label(parent, "", fg=FG_DIM, font=FONT_S, cursor="hand2")
         self.summary_lbl.pack(anchor="w")
+        self._summary_path = ""
+        self.summary_lbl.bind("<Button-1>", lambda _e: self._summary_path and self._open_path(self._summary_path))
 
         grid = tk.Frame(parent, bg=BG)
         grid.pack(fill="x", pady=(6, 4))
@@ -525,6 +530,7 @@ class FloatingOverlayApp:
         c.ai_allow_reply = bool(self.allow_reply_var.get())
         c.ai_auto_choose = bool(self.auto_choose_var.get())
         c.driver_enabled = bool(self.driver_var.get())
+        c.notify_enabled = bool(self.notify_var.get())
         t = self.summary_time_var.get().strip()
         if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", t):
             c.daily_summary_time = t
@@ -970,7 +976,8 @@ class FloatingOverlayApp:
                     dlg.on_send_result(ev["ok"], ev["text"])
                 self._append_log(("✅ " if ev["ok"] else "⛔ ") + ev["text"])
             elif kind == "summary":
-                self.summary_lbl.configure(text=f"最近一次：{os.path.basename(ev['path'])}")
+                self._summary_path = ev["path"]
+                self.summary_lbl.configure(text=f"最近一次：{os.path.basename(ev['path'])}（點這裡打開）", fg="#38BDF8")
                 if ev.get("alert"):
                     self.root.bell()
             elif kind == "humans":

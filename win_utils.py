@@ -605,3 +605,42 @@ def send_inputs(seq: List[_INPUT]) -> int:
         return 0
     arr = (_INPUT * len(seq))(*seq)
     return int(user32.SendInput(len(seq), arr, ctypes.sizeof(_INPUT)))
+
+
+# ---- Windows 通知（Toast）：用內建的 Windows PowerShell 5.1 顯示，不需要額外套件
+_TOAST_APP_ID = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
+
+
+def build_toast_xml(title: str, body: str, launch: str = "") -> str:
+    """launch 是點通知時要開的檔案路徑（例如每日摘要）；空字串代表點了只是關掉。"""
+    from xml.sax.saxutils import escape, quoteattr
+    attrs = ""
+    if launch:
+        import pathlib
+        attrs = f" activationType=\"protocol\" launch={quoteattr(pathlib.Path(launch).resolve().as_uri())}"
+    return (f"<toast{attrs}><visual><binding template=\"ToastGeneric\">"
+            f"<text>{escape(title[:120])}</text><text>{escape(body[:400])}</text>"
+            "</binding></visual></toast>")
+
+
+def notify(title: str, body: str, launch: str = "") -> bool:
+    """跳出 Windows 通知，不等待、不搶焦點；失敗就安靜略過（回傳 False）。"""
+    import base64
+    import subprocess
+    xml = build_toast_xml(title, body, launch).replace("'", "''")
+    script = (
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;"
+        "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;"
+        "$x = New-Object Windows.Data.Xml.Dom.XmlDocument;"
+        f"$x.LoadXml('{xml}');"
+        "$t = New-Object Windows.UI.Notifications.ToastNotification $x;"
+        f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{_TOAST_APP_ID}').Show($t)"
+    )
+    enc = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+                          "-EncodedCommand", enc], creationflags=0x08000000,  # CREATE_NO_WINDOW
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False

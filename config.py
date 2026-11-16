@@ -110,6 +110,8 @@ class AppConfig:
     driver_enabled: bool = True
     # 每日摘要產生時間（HH:MM）
     daily_summary_time: str = "18:00"
+    # 「需要你決定」與每日摘要跳 Windows 通知
+    notify_enabled: bool = True
     # P2 自動駕駛（各工作階段另外要打開「自動駕駛」才會生效）
     autopilot_max_per_hour: float = 12.0
     evidence_max_attempts: float = 3.0

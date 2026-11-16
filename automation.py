@@ -592,6 +592,8 @@ class AutomationWorker(threading.Thread):
         self._ai_backoff = 0.0
         self._ai_backoff_until = 0.0
         self._restored_at: Dict[int, float] = {}  # 被使用者輸入中止的訊息（輸入框可能留下半截）
+        self._notified: Dict[str, set] = {}  # 已跳過通知的「需要你決定」事項
+        self._notify_at: Dict[str, float] = {}
         try:
             wu.InputMonitor.get()  # 盡早掛上輸入偵測
         except Exception:
@@ -1001,6 +1003,32 @@ class AutomationWorker(threading.Thread):
         return self._do_send(w.key, st.suggested_prompt or drv2.build_continuation_prompt(st), by=by,
                              skip_foreground_check=True)
 
+    def _notify_pending(self, w: ProjectWindow) -> None:
+        """「需要你決定」出現新事項時跳 Windows 通知；啟動時已存在的不重複通知，同一視窗 60 秒最多一則。"""
+        if not self.cfg.notify_enabled:
+            return
+        st = self._session_for(w).load()
+        items = set(st.pending_human)
+        if st.pending_approval and self.cfg.mode_of(w.key) != "auto":
+            items.add("代理在等你允許：" + re.sub(r"\s+", " ", st.pending_approval)[:80])
+        seen = self._notified.get(w.key)
+        if seen is None:
+            self._notified[w.key] = items
+            return
+        new = [i for i in items if i not in seen]
+        if not new or wu.get_foreground() == w.hwnd:  # 你正看著那個 IDE 就不打擾
+            self._notified[w.key] = items
+            return
+        now = time.monotonic()
+        if now - self._notify_at.get(w.key, -1e9) < 60:
+            self._notified[w.key] = seen & items  # 新事項留到下次再通知
+            return
+        self._notify_at[w.key] = now
+        self._notified[w.key] = items
+        body = "；".join(new[:3]) + (f"（另有 {len(new) - 3} 項）" if len(new) > 3 else "")
+        wu.notify(f"AI 工程助理｜{w.app_label}：{w.project} 需要你決定", body)
+        self._log(f"🔔 [{self._app_name(w)}] 已通知：{body[:80]}")
+
     def _maybe_daily_summary(self) -> None:
         today = datetime.date.today().isoformat()
         if self._last_summary_date == today:
@@ -1016,6 +1044,10 @@ class AutomationWorker(threading.Thread):
             path = write_daily_summary(self.store, today)
             self._log(f"📝 已產生每日摘要：{path}")
             self._emit("summary", path=path, alert=True)
+            if self.cfg.notify_enabled:
+                waiting = sum(len(s.load().pending_human) for s in self.store.all())
+                wu.notify("AI 工程助理｜今天的每日摘要已產生",
+                          f"點這裡打開。等你決定的事項：{waiting} 項", launch=path)
         except OSError as e:
             self._log(f"⚠ 每日摘要失敗：{e!r}")
 
@@ -1530,6 +1562,7 @@ class AutomationWorker(threading.Thread):
                 return
             try:
                 self._ai_window(w, vision, judge, decision)
+                self._notify_pending(w)
             except COMError:
                 # Chromium 剛開啟無障礙樹時常回 EVENT_E_NO_SUBSCRIBERS 等暫時性錯誤，下一輪再試
                 continue
