@@ -26,12 +26,16 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
     if start != -1 and end > start:
         candidates.append(text[start:end + 1])
     for c in candidates:
-        try:
-            obj = json.loads(c)
-            if isinstance(obj, dict):
-                return obj
-        except ValueError:
-            continue
+        # 模型照抄長指令時常出現：字串裡直接換行、Windows 路徑的單一反斜線（\_ \A 這類無效跳脫）、結尾多餘逗號
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", c)
+        repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+        for attempt in (c, repaired):
+            try:
+                obj = json.loads(attempt, strict=False)
+                if isinstance(obj, dict):
+                    return obj
+            except ValueError:
+                continue
     return None
 
 

@@ -36,7 +36,7 @@ GOOD_REPORT = """# 測試報告
 指令：python -m pytest -q
 輸出：3 passed in 0.12s
 故意弄壞：把 export() 改成回傳空值 → 2 failed；改回後 3 passed；git status 乾淨
-分支 feature/export，commit {h}
+COMMIT: {h} feature/export
 """
 
 
@@ -53,7 +53,7 @@ def test_extract_hashes_ignores_plain_numbers():
 
 def test_gather_facts_finds_commit_branch_and_stubs(repo):
     path, h = repo
-    facts = verifier.gather_facts(str(path), GOOD_REPORT.format(h=h) + "另外 commit deadbee 也是")
+    facts = verifier.gather_facts(str(path), GOOD_REPORT.format(h=h) + "COMMIT: deadbee feature/export`n其他專案狀態：buttonAuto f1c131d 有變動")
     assert facts["is_repo"] and facts["branch"] == "feature/export" and facts["dirty"] == []
     by_hash = {c["hash"]: c for c in facts["commits"]}
     assert by_hash[h]["exists"] and "export.py" in by_hash[h]["files"]
@@ -72,7 +72,7 @@ def test_deterministic_issues_main_branch_dirty_and_missing_sections(repo):
     facts = verifier.gather_facts(str(path), "沒有測試輸出也沒有 commit")
     issues = verifier.deterministic_issues(facts, "全部完成了", remote=False)
     text = "\n".join(issues)
-    for must in ("沒有看到測試輸出", "故意弄壞", "`main` 分支", "沒有提供 commit hash", "未 commit 的變更"):
+    for must in ("沒有看到測試輸出", "故意弄壞", "沒有提供 commit hash", "未 commit 的變更"):
         assert must in text
     assert verifier.deterministic_issues({}, "", remote=True) == ["沒有找到測試報告"]
     # 遠端專案只檢查報告內容
@@ -185,3 +185,54 @@ def test_parse_spec_lines_and_latest_segment():
     assert [i["text"] for i in items] == ["slugify 轉小寫", "合併連字號"]
     assert items[0]["test"] == "test_lower；執行 pytest -q" and items[1]["how"] == "輸入 a--b 得到 a-b"
     assert drv2.parse_spec_lines(sent) == []  # 我們自己送出的格式範例不算
+
+
+def test_claimed_hashes_and_branch_check(repo):
+    path, h = repo
+    report = f"測試 3 passed，故意弄壞後失敗\nCOMMIT: {h} feature/export\n其他專案 buttonAuto 最新為 abcdef1，與本次無關"
+    assert verifier.claimed_hashes(report) == [h]
+    loose = f"我在 feature/export 分支 commit {h}\n其他專案 abcdef1"
+    assert verifier.claimed_hashes(loose) == [h]
+    facts = verifier.gather_facts(str(path), report)
+    assert facts["commits"][0]["branches"] == ["feature/export"]
+    assert not any("主分支" in x for x in verifier.deterministic_issues(facts, report, remote=False))
+    # 只在 main 上的 commit
+    _git(path, "checkout", "-q", "main")
+    (path / "only_main.py").write_text("x = 1\n", encoding="utf-8")
+    _git(path, "add", ".")
+    _git(path, "commit", "-q", "-m", "main only")
+    rc = subprocess.run(["git", "-C", str(path), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+    facts2 = verifier.gather_facts(str(path), f"COMMIT: {rc} main\n3 passed 故意弄壞")
+    assert any("主分支" in x for x in verifier.deterministic_issues(facts2, "3 passed 故意弄壞", remote=False))
+    with pytest.raises(ValueError):
+        verifier.git(str(path), "branch", "-D", "feature/export")
+
+
+def test_core_items_and_manual_items_drive_done():
+    from sessions import core_items, is_automated
+    auto_item = {"text": "slugify 轉小寫", "test": "test_textutils.py::test_lowercase", "status": "todo"}
+    manual = {"text": "其他專案沒有被改動", "test": "無（快照比對）", "status": "todo"}
+    handcheck = {"text": "README 有說明", "test": "無（手動指令）`git log`", "status": "todo"}
+    assert is_automated(auto_item) and not is_automated(manual) and not is_automated(handcheck)
+    st = SessionState(goal="G", acceptance_confirmed_at="t", acceptance=[auto_item, manual, handcheck])
+    assert core_items(st) == [auto_item]
+    assert phase_of(st) == "build"
+    auto_item["status"] = "verified"
+    assert phase_of(st) == "done"  # 手動項目不擋住完成，最後列給使用者確認
+    only_manual = SessionState(goal="G", acceptance_confirmed_at="t", acceptance=[dict(manual)])
+    assert core_items(only_manual) == only_manual.acceptance  # 全是手動項目時，全部都要查核
+
+
+def test_evidence_request_lists_only_core_items_and_latest_reply():
+    st = SessionState(goal="G", acceptance=[
+        {"text": "核心 A", "test": "test_a", "status": "todo"},
+        {"text": "環境 B", "test": "無（快照比對）", "status": "todo"}])
+    req = drv2.build_evidence_request(st, "")
+    assert "- 核心 A" in req and "- 環境 B" not in req and "1 條手動檢查項目" in req
+    assert req.rstrip().endswith(drv2.REQUEST_END)
+    chat = "舊回覆：3 passed\n" + req + "\n代理：COMMIT: abc1234 feature/x\n4 passed"
+    reply = drv2.latest_reply(chat)
+    assert "COMMIT: abc1234" in reply and "舊回覆" not in reply and "核心 A" not in reply
+    assert drv2.latest_reply("沒有要求的對話") == "沒有要求的對話"
+    verify = drv2.build_verify_prompt(st, "r", "facts", [])
+    assert "0. 核心 A" in verify and "環境 B" not in verify

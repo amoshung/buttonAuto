@@ -85,7 +85,8 @@ class AppConfig:
     ai_dry_run: bool = True
     ai_min_confidence: float = 0.6
     ai_max_risk: float = 0.3
-    ai_idle_sec: float = 3.0
+    # 鍵盤與滑鼠都停止這麼多秒後才會點擊或打字（讀畫面不受限）
+    ai_idle_sec: float = 5.0
     ai_recheck_sec: float = 60.0
     ai_continue_text: str = "繼續"
     ai_send_key: str = "enter"

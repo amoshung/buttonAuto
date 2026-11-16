@@ -2,6 +2,7 @@
 import ctypes
 import ctypes.wintypes as W
 import io
+import threading
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -222,6 +223,133 @@ class _FLASHWINFO(ctypes.Structure):
 def flash_window(hwnd: int, count: int = 5) -> None:
     info = _FLASHWINFO(ctypes.sizeof(_FLASHWINFO), hwnd, 0x3 | 0xC, count, 0)  # FLASHW_ALL | FLASHW_TIMERNOFG
     user32.FlashWindowEx(ctypes.byref(info))
+
+
+# ---- 使用者真實輸入偵測（低階鍵盤／滑鼠掛鉤，能分辨使用者輸入與程式模擬的輸入） ----
+WH_KEYBOARD_LL, WH_MOUSE_LL = 13, 14
+LLKHF_INJECTED, LLMHF_INJECTED = 0x10, 0x01
+_LRESULT = ctypes.c_ssize_t
+_HOOKPROC = ctypes.WINFUNCTYPE(_LRESULT, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t)
+user32.SetWindowsHookExW.restype = VP
+user32.SetWindowsHookExW.argtypes = [ctypes.c_int, _HOOKPROC, VP, W.DWORD]
+user32.CallNextHookEx.restype = _LRESULT
+user32.CallNextHookEx.argtypes = [VP, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t]
+user32.UnhookWindowsHookEx.argtypes = [VP]
+kernel32.GetModuleHandleW.restype = VP
+kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+
+
+class _KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", W.DWORD), ("scanCode", W.DWORD), ("flags", W.DWORD), ("time", W.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt", W.POINT), ("mouseData", W.DWORD), ("flags", W.DWORD), ("time", W.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class InputMonitor:
+    """在獨立執行緒掛上低階鍵盤與滑鼠掛鉤，只記錄「使用者真實輸入」的時間（略過 SendInput 模擬的輸入）。
+
+    掛鉤只記時間、立刻放行，不攔截、不修改任何輸入。掛不上時退回 GetLastInputInfo（無法分辨模擬輸入）。
+    """
+
+    _instance: Optional["InputMonitor"] = None
+
+    def __init__(self) -> None:
+        self.last_real = time.monotonic()
+        self.ok = False
+        self._ready = threading.Event()
+        self._kb = _HOOKPROC(self._on_kb)
+        self._ms = _HOOKPROC(self._on_ms)
+        self._hooks: List[int] = []
+        threading.Thread(target=self._run, daemon=True, name="InputMonitor").start()
+        self._ready.wait(2.0)
+
+    @classmethod
+    def get(cls) -> "InputMonitor":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def _on_kb(self, code, wparam, lparam):
+        if code >= 0:
+            info = ctypes.cast(lparam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+            if not info.flags & LLKHF_INJECTED:
+                self.last_real = time.monotonic()
+        return user32.CallNextHookEx(None, code, wparam, lparam)
+
+    def _on_ms(self, code, wparam, lparam):
+        if code >= 0:
+            info = ctypes.cast(lparam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
+            if not info.flags & LLMHF_INJECTED:
+                self.last_real = time.monotonic()
+        return user32.CallNextHookEx(None, code, wparam, lparam)
+
+    def _run(self) -> None:
+        mod = kernel32.GetModuleHandleW(None)
+        for kind, proc in ((WH_KEYBOARD_LL, self._kb), (WH_MOUSE_LL, self._ms)):
+            h = user32.SetWindowsHookExW(kind, proc, mod, 0)
+            if h:
+                self._hooks.append(h)
+        self.ok = len(self._hooks) == 2
+        self._ready.set()
+        msg = W.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    def real_idle_seconds(self) -> float:
+        if self.ok:
+            return time.monotonic() - self.last_real
+        return idle_seconds()
+
+    def real_input_since(self, t: float) -> bool:
+        """t（time.monotonic）之後，使用者是否動過鍵盤或滑鼠。"""
+        if self.ok:
+            return self.last_real > t
+        return idle_seconds() < (time.monotonic() - t) - 0.05
+
+
+def real_idle_seconds() -> float:
+    return InputMonitor.get().real_idle_seconds()
+
+
+# ---- 全螢幕偵測（簡報、影片、遊戲時暫停所有動作） ----
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", W.DWORD), ("rcMonitor", W.RECT), ("rcWork", W.RECT), ("dwFlags", W.DWORD)]
+
+
+user32.MonitorFromWindow.restype = VP
+user32.MonitorFromWindow.argtypes = [VP, W.DWORD]
+user32.GetMonitorInfoW.argtypes = [VP, ctypes.POINTER(_MONITORINFO)]
+user32.GetClassNameW.argtypes = [VP, ctypes.c_wchar_p, ctypes.c_int]
+user32.GetWindowLongW.argtypes = [VP, ctypes.c_int]
+user32.GetShellWindow.restype = VP
+user32.GetDesktopWindow.restype = VP
+
+
+def foreground_is_fullscreen() -> bool:
+    fg = get_foreground()
+    if not fg or fg in (int(user32.GetShellWindow() or 0), int(user32.GetDesktopWindow() or 0)):
+        return False
+    buf = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(fg, buf, 64)
+    if buf.value in ("Progman", "WorkerW", "Shell_TrayWnd"):
+        return False
+    mon = user32.MonitorFromWindow(fg, 2)  # MONITOR_DEFAULTTONEAREST
+    info = _MONITORINFO()
+    info.cbSize = ctypes.sizeof(_MONITORINFO)
+    if not mon or not user32.GetMonitorInfoW(mon, ctypes.byref(info)):
+        return False
+    # 最大化的一般視窗也會蓋滿螢幕，但有標題列；真正的全螢幕（簡報、影片、遊戲）沒有標題列
+    style = user32.GetWindowLongW(fg, -16)  # GWL_STYLE
+    if style & 0x00C00000 == 0x00C00000:    # WS_CAPTION
+        return False
+    l, t, r, b = get_window_rect(fg)
+    m = info.rcMonitor
+    return l <= m.left and t <= m.top and r >= m.right and b >= m.bottom
 
 
 # ---- 剪貼簿（貼上文字可避開中文輸入法打亂標點） ----

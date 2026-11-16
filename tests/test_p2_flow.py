@@ -23,7 +23,7 @@ class FakeJudge:
         self.calls.append(prompt[:40])
         if "代理提出的驗收條件" in prompt:
             return json.dumps({"items": [{"text": "按匯出可下載 CSV", "how": "跑測試", "test": "pytest -q"}]}, ensure_ascii=False)
-        if "嚴格的驗收審查者" in prompt:
+        if "驗收審查者" in prompt:
             return '{"ok": true, "issues": [], "needs_user": []}'
         if "負責督導" in prompt:
             return json.dumps({"action": "next_task", "reason": "代理說完成了", "prompt": "繼續",
@@ -105,7 +105,7 @@ def test_full_p2_flow_until_done(tmp_path):
     # 代理寫好報告 → 唯讀查核（commit 存在、在功能分支、沒有空殼）→ 全部通過 → ④ 完成並關閉自動駕駛
     with open(st.report_path, "w", encoding="utf-8") as f:
         f.write(f"python -m pytest -q\n3 passed\n故意弄壞：改壞後 1 failed，改回後 3 passed，git status 乾淨\n"
-                f"分支 feature/export，commit {h}\n")
+                f"COMMIT: {h} feature/export\n")
     sess.update(lambda s: setattr(s, "autopilot", True))
     w._drive(pw, stopped, "panel-5：報告已寫入", judge)
     st = sess.load()
@@ -144,3 +144,25 @@ def test_fake_commit_and_missing_mutation_are_rejected_then_pause(tmp_path):
         assert any("deadbee" in x for x in st.last_issues) and any("故意弄壞" in x for x in st.last_issues)
     assert st.paused_reason.startswith("連續 3 次要不到合格的證據")
     assert st.suggested_action == "ask_human"
+
+
+def test_no_loop_when_assistant_did_not_send(tmp_path):
+    path, _ = _repo(tmp_path)
+    w = _worker(tmp_path)
+    pw = ProjectWindow(1, "kiro", "Kiro", "t", "proj", "", str(path), False, False)
+    sess = w._session_for(pw)
+
+    def setup(st):
+        st.goal, st.acceptance_confirmed_at = "G", now_str()
+        st.acceptance = [{"text": "A", "status": "todo"}]
+    sess.update(setup)
+    judge = FakeJudge()
+    same = "代理：我在等你回覆，請問要繼續嗎？" * 3
+    for i in range(5):
+        sess.update(lambda s: setattr(s, "last_panel_hash", ""))  # 模擬每輪都重新分析同一個畫面
+        w._drive(pw, {"agent_state": "waiting_input", "summary": "停"}, same, judge)
+        assert sess.load().suggested_action != "rollover"
+    # 助理連續 3 次送出後，代理仍停在幾乎一樣的內容，才算原地打轉
+    sess.update(lambda s: (setattr(s, "recent_tails", [drv2.agent_tail(same)] * 3), setattr(s, "last_panel_hash", "")))
+    w._drive(pw, {"agent_state": "waiting_input", "summary": "停"}, same, judge)
+    assert sess.load().suggested_action == "rollover"

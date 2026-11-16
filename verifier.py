@@ -8,7 +8,9 @@ import subprocess
 from typing import Any, Dict, List, Tuple
 
 # 只允許讀取類的 git 子指令
-_READONLY_GIT = {"rev-parse", "status", "cat-file", "show", "log", "diff"}
+_READONLY_GIT = {"rev-parse", "status", "cat-file", "show", "log", "diff", "branch"}
+# git branch 只允許查詢用的參數（不允許建立、刪除、改名分支）
+_BRANCH_QUERY = {"--contains", "--show-current", "--list", "-a", "--all", "--format=%(refname:short)"}
 _MAIN_BRANCHES = {"main", "master", "develop", "trunk"}
 _TEXT_EXT = {".py", ".rs", ".cs", ".vb", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".kt", ".c", ".cc", ".cpp",
              ".h", ".hpp", ".rb", ".php", ".swift", ".sql", ".ps1", ".sh"}
@@ -27,6 +29,8 @@ STUB_PATTERNS: List[Tuple[str, str]] = [
 def git(path: str, *args: str, timeout: float = 15.0) -> Tuple[int, str]:
     if not args or args[0] not in _READONLY_GIT:
         raise ValueError(f"不允許的 git 指令：{args[:1]}")
+    if args[0] == "branch" and not any(a in _BRANCH_QUERY for a in args[1:]):
+        raise ValueError("git branch 只允許查詢")
     try:
         p = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -35,13 +39,35 @@ def git(path: str, *args: str, timeout: float = 15.0) -> Tuple[int, str]:
         return -1, str(e)
 
 
-def extract_hashes(text: str) -> List[str]:
+def extract_hashes(text: str, require_letter: bool = True) -> List[str]:
     """報告或聊天裡提到的 commit hash（7~40 個十六進位字元，且至少有一個字母，避免把數字當成 hash）。"""
     out: List[str] = []
     for m in re.finditer(r"(?<![0-9a-fA-F])([0-9a-f]{7,40})(?![0-9a-fA-F])", text or ""):
         h = m.group(1)
-        if re.search(r"[a-f]", h) and h not in out:
+        if (not require_letter or re.search(r"[a-f]", h)) and h not in out:
             out.append(h)
+    return out[:20]
+
+
+_CLAIM_LINE = re.compile(r"^\s*[-*>]?\s*COMMIT\s*[:：]", re.I | re.M)
+_COMMIT_WORD = re.compile(r"commit|hash|提交|分支|branch", re.I)
+
+
+def claimed_hashes(report: str) -> List[str]:
+    """代理宣稱「這是我的 commit」的 hash。
+
+    優先只看「COMMIT: <hash> <分支>」格式的行；沒有這種行時，才看含有 commit / hash / 分支字樣的行。
+    報告中其他地方出現的 hash（例如引用別的專案的 git 狀態）不算，避免把無關的 hash 當成假 commit。
+    """
+    lines = (report or "").splitlines()
+    picked = [ln for ln in lines if _CLAIM_LINE.match(ln)]
+    if not picked:
+        picked = [ln for ln in lines if _COMMIT_WORD.search(ln)]
+    out: List[str] = []
+    for ln in picked:
+        for h in extract_hashes(ln, require_letter=not _CLAIM_LINE.match(ln)):
+            if h not in out:
+                out.append(h)
     return out[:20]
 
 
@@ -82,10 +108,12 @@ def gather_facts(path: str, report_text: str) -> Dict[str, Any]:
     rc, out = git(path, "log", "--oneline", "-n", "15")
     facts["recent"] = out.strip() if rc == 0 else ""
     changed: List[str] = []
-    for h in extract_hashes(report_text):
+    for h in claimed_hashes(report_text):
         rc, _ = git(path, "cat-file", "-e", f"{h}^{{commit}}")
-        info: Dict[str, Any] = {"hash": h, "exists": rc == 0, "subject": "", "files": []}
+        info: Dict[str, Any] = {"hash": h, "exists": rc == 0, "subject": "", "files": [], "branches": []}
         if rc == 0:
+            rc3, out3 = git(path, "branch", "--contains", h, "--format=%(refname:short)")
+            info["branches"] = [b.strip() for b in out3.splitlines() if b.strip()] if rc3 == 0 else []
             rc2, out2 = git(path, "show", "--name-only", "--format=%s", h)
             if rc2 == 0:
                 lines = [ln for ln in out2.splitlines() if ln.strip()]
@@ -116,11 +144,12 @@ def deterministic_issues(facts: Dict[str, Any], report_text: str, remote: bool) 
     if not facts.get("is_repo"):
         issues.append("專案路徑不是 git repo，無法查核 commit")
         return issues
-    if facts.get("branch") in _MAIN_BRANCHES:
-        issues.append(f"目前在 `{facts['branch']}` 分支上，請改在功能分支上實作與 commit")
     commits = facts.get("commits") or []
+    existing = [c for c in commits if c.get("exists")]
+    if existing and all(set(c.get("branches") or []) <= _MAIN_BRANCHES for c in existing):
+        issues.append("報告的 commit 都只在主分支上，請改在功能分支上實作與 commit")
     if not commits:
-        issues.append("報告沒有提供 commit hash")
+        issues.append("報告沒有提供 commit hash（請用「COMMIT: <hash> <分支>」的格式逐行列出）")
     for c in commits:
         if not c.get("exists"):
             issues.append(f"報告提到的 commit `{c['hash']}` 在 repo 裡找不到")
@@ -139,7 +168,8 @@ def facts_summary(facts: Dict[str, Any]) -> str:
              "報告提到的 commit："]
     for c in facts.get("commits") or []:
         mark = "存在" if c.get("exists") else "不存在"
-        lines.append(f"- {c['hash']}（{mark}）{c.get('subject', '')}；檔案：{', '.join(c.get('files', [])[:10])}")
+        lines.append(f"- {c['hash']}（{mark}；所在分支：{', '.join(c.get('branches', [])) or '—'}）{c.get('subject', '')}；"
+                     f"檔案：{', '.join(c.get('files', [])[:10])}")
     if not facts.get("commits"):
         lines.append("（無）")
     lines.append("空殼跡象：" + ("；".join(f"{s['file']}:{s['line']} {s['kind']}" for s in facts.get("stubs", [])[:10])

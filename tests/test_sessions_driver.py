@@ -55,13 +55,13 @@ def test_interactions_are_capped():
 
 def test_render_progress_sections():
     st = SessionState(app="Kiro", project="p", path="D:\\p", goal="G", acceptance=[
-        {"text": "匯出 CSV", "how": "pytest tests/test_export.py", "status": "verified"},
+        {"text": "匯出 CSV", "how": "pytest tests/test_export.py", "test": "test_export.py", "status": "verified"},
         {"text": "匯出 PDF", "status": "todo"}],
         commits=[{"time": "t", "branch": "feature/x", "hash": "abc1234", "desc": "d", "check": "未查核"}],
         suggested_action="request_evidence", suggested_prompt="請貼出測試輸出", suggested_reason="r")
     md = render_progress(st, [{"name": "spec-a", "tasks_done": 2, "tasks_total": 5}])
-    assert "- [x] 匯出 CSV（如何查核：pytest tests/test_export.py）" in md
-    assert "- [ ] 匯出 PDF" in md
+    assert "- [x] 匯出 CSV（如何查核：pytest tests/test_export.py；測試：test_export.py）" in md
+    assert "- [ ] 👁 手動檢查：匯出 PDF" in md
     assert "| t | feature/x | abc1234 | d | 未查核 |" in md
     assert "`spec-a`：tasks 2/5" in md
     assert "請貼出測試輸出" in md

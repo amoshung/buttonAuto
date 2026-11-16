@@ -32,13 +32,15 @@ from projects import ProjectDetector, ProjectWindow
 import driver as drv
 import driver_p2 as drv2
 import verifier
-from sessions import SessionStore, now_str, phase_of, read_kiro_specs, read_plans, write_daily_summary
+from sessions import SessionStore, core_items, is_automated, now_str, phase_of, read_kiro_specs, read_plans, \
+    write_daily_summary
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(BASE_DIR, "automation.log")
 LOG_MAX_BYTES = 5 * 1024 * 1024
 
 ASK_HUMAN_TOKEN = "[ASK_HUMAN]"
+USER_ABORT = "偵測到你在操作鍵盤或滑鼠"
 MINIMIZED_TEXT = "🗕 視窗最小化：無法截圖觀察，還原視窗後才會繼續"
 NO_ACTION_STATES = ("working", "done", "idle")
 
@@ -54,11 +56,22 @@ class Plan:
     scores: Dict[str, Any] = field(default_factory=dict)
 
 
-def check_deny(texts: List[str], patterns: List[str]) -> Optional[str]:
+_NEGATION = re.compile(r"(不要|不可以|不可|不准|禁止|不得|請勿|勿|別|不能|嚴禁|未執行|沒有|don'?t|do not|never|must not|no)\W{0,3}"
+                       r"[^。；;\n]{0,12}$", re.I)
+
+
+def check_deny(texts: List[str], patterns: List[str], allow_negated: bool = False) -> Optional[str]:
+    """命中危險規則就回傳該規則。
+
+    allow_negated=True 用在助理自己要送出的訊息：「不要 git push」「禁止 rm -rf」這類禁止的說法不算命中。
+    代理要執行的指令一律 allow_negated=False。
+    """
     joined = "\n".join(t for t in texts if t)
     for p in patterns:
         try:
-            if re.search(p, joined, re.I):
+            for m in re.finditer(p, joined, re.I):
+                if allow_negated and _NEGATION.search(joined[max(0, m.start() - 20):m.start()]):
+                    continue
                 return p
         except re.error:
             continue
@@ -442,6 +455,11 @@ class AutomationWorker(threading.Thread):
         self.commands: "queue.Queue[tuple]" = queue.Queue()
         self._last_summary_date = ""
         self._ctx_cache: Dict[str, Tuple[float, List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
+        self._aborted: Dict[str, str] = {}  # 被使用者輸入中止的訊息（輸入框可能留下半截）
+        try:
+            wu.InputMonitor.get()  # 盡早掛上輸入偵測
+        except Exception:
+            pass
 
     # ---- 給 UI 執行緒呼叫
     def stop(self) -> None:
@@ -483,6 +501,24 @@ class AutomationWorker(threading.Thread):
         """只回傳使用者勾選的工作階段視窗（Kiro / Antigravity，且要辨識得出專案）。"""
         allowed = set(self.cfg.authorized_sessions)
         return [p for p in self.detector.detect() if p.project and p.key in allowed]
+
+    def _user_guard(self, w: Optional[ProjectWindow], typing: bool, by: str = "assistant") -> str:
+        """會干擾使用者時回傳原因（不動手）；空字串代表可以動手。
+
+        - 讀畫面不受限制，這裡只管「點擊」與「打字」。
+        - 使用者親自在面板按的操作（by="user"）不檢查閒置，但仍檢查全螢幕。
+        """
+        if wu.foreground_is_fullscreen():
+            return "你正在使用全螢幕程式"
+        if by == "user":
+            return ""
+        idle = wu.real_idle_seconds()
+        need = float(self.cfg.ai_idle_sec)
+        if idle < need or wu.modifier_keys_down():
+            return f"你正在操作鍵盤或滑鼠（停止 {need:.0f} 秒後才會動作）"
+        if typing and w is not None and wu.get_foreground() == w.hwnd:
+            return "你正在使用這個 IDE 視窗，打字會打斷你"
+        return ""
 
     def _still_authorized(self, w: ProjectWindow) -> bool:
         """動手前再確認一次：視窗還在、開的還是同一個專案、而且仍是勾選狀態。"""
@@ -560,7 +596,7 @@ class AutomationWorker(threading.Thread):
     def _session_for(self, w: ProjectWindow):
         return self.store.get(w.key, w.app_label, w.project, w.path, w.remote)
 
-    def _do_send(self, key: str, text: str, by: str = "user") -> bool:
+    def _do_send(self, key: str, text: str, by: str = "user", skip_foreground_check: bool = False) -> bool:
         """送出訊息（使用者在面板上按「送出」，或自動駕駛）：先讀 progress、記錄打算做的事，再輸入。"""
         def fail(why: str) -> bool:
             self._log(f"⛔ 送出失敗（{key}）：{why}")
@@ -578,7 +614,7 @@ class AutomationWorker(threading.Thread):
         w = wins[0]
         if w.iconic:
             return fail("視窗最小化了，請先還原")
-        hit = check_deny([text], self.cfg.deny_patterns)
+        hit = check_deny([text], self.cfg.deny_patterns, allow_negated=True)
         if hit:
             return fail(f"訊息命中危險規則 /{hit}/")
         sess = self._session_for(w)
@@ -589,17 +625,33 @@ class AutomationWorker(threading.Thread):
         inp = uw.chat_input()
         if inp is None:
             return fail("找不到聊天輸入框")
+        guard = self._user_guard(w, typing=not skip_foreground_check, by=by)
+        if guard:
+            return fail(f"延後送出：{guard}")
         if ud.input_has_draft(inp):
-            return fail("輸入框內已有文字（可能是先前沒送出去的訊息），請先清空或自己按 Enter 送出")
+            left = self._aborted.get(key, "")
+            draft = ud.input_text(inp)
+            if left and draft and ud.same_text(draft[: len(left)], left[: len(draft)]):
+                # 上次被你的輸入中止時留下的半截訊息：先清掉再重送
+                if not self._clear_input(w.hwnd, inp):
+                    return fail("上次中止時留下的文字無法自動清除，請到 IDE 手動清空輸入框")
+                sess.history("cleared_aborted", text=draft[:120])
+            else:
+                return fail("輸入框內已有文字（可能是你打到一半的訊息），請先清空或自己按 Enter 送出")
         panel = uw.panel_of(inp)
         busy = ud.agent_busy_reason(uw.buttons(), ud.control_rect(panel) if panel is not None else None)
         if busy:
             return fail(f"{busy}，現在送出代理不會處理。請先處理完再送。")
         if not self._still_authorized(w):
             return fail("視窗已關閉、換了專案或取消勾選")
-        ok, why = self._type_into(w.hwnd, inp, text)
+        tail_before = drv2.agent_tail(uw.panel_text(panel, 4000)) if panel is not None else ""
+        ok, why = self._type_into(w.hwnd, inp, text, watch_user=(by != "user"))
         if not ok:
+            if why.startswith(USER_ABORT):
+                self._aborted[key] = text
+                sess.history("aborted_by_user", text=text[:120])
             return fail(why)
+        self._aborted.pop(key, None)
         time.sleep(1.0)
         if ud.input_has_draft(inp):
             sess.history("blocked", text="訊息留在輸入框，沒有送出")
@@ -620,6 +672,10 @@ class AutomationWorker(threading.Thread):
                 st.sends_in_conversation = 0
                 st.recent_tails = []
             st.sends_in_conversation += 1
+            if by == "assistant" and tail_before:
+                st.recent_tails = (st.recent_tails + [tail_before])[-5:]
+            if text.startswith(drv2.CONTINUE_MARK):
+                st.rollover_pending = False
             if by == "user":
                 # 使用者親自回覆，視為已處理先前交給他的取捨
                 st.pending_human = [p for p in st.pending_human if not p.startswith("驗收 spec 需要你決定")]
@@ -736,15 +792,16 @@ class AutomationWorker(threading.Thread):
         if n >= int(self.cfg.autopilot_max_per_hour):
             self._session(w, f"⏳ 已達每小時自動送出上限（{n} 次），稍後再送")
             return
-        if wu.idle_seconds() < self.cfg.ai_idle_sec or wu.modifier_keys_down():
-            self._session(w, f"⏳ 等你停止操作 {self.cfg.ai_idle_sec:.0f} 秒後自動送出")
+        why = self._user_guard(w, typing=True)
+        if why:
+            self._session(w, f"⏳ 有建議等著自動送出：{why}")
             return
         if (phase_of(st) == "build" and st.sends_in_conversation >= int(self.cfg.rollover_after_sends)
                 and st.suggested_action != "rollover"):
             self._log(f"🔄 [{self._app_name(w)}] 這個對話已送出 {st.sends_in_conversation} 則，開新對話接續")
             self._do_rollover(w)
             return
-        if st.suggested_action == "rollover":
+        if st.suggested_action == "rollover" or st.rollover_pending:
             self._do_rollover(w)
             return
         self._do_send(w.key, st.suggested_prompt, by="assistant")
@@ -754,34 +811,47 @@ class AutomationWorker(threading.Thread):
         if not wins:
             self._emit("send_result", key=key, ok=False, text="找不到這個工作階段的視窗")
             return
-        self._do_rollover(wins[0])
+        self._do_rollover(wins[0], by="user")
 
-    def _do_rollover(self, w: ProjectWindow) -> bool:
+    def _do_rollover(self, w: ProjectWindow, by: str = "assistant") -> bool:
         """開新的聊天對話，並送出用 progress 整理的接續摘要。"""
         if not self.cfg.is_authorized(w.key) or not self._still_authorized(w):
             return False
-        uw = ud.UiaWindow(w.hwnd)
-        btn = None
-        for name in ("New session", "New Conversation", "New Chat", "新對話"):
-            btn = ud.pick_button(uw.buttons(), name)
-            if btn is not None:
-                break
-        if btn is None or not ud.invoke(btn.control):
-            self._emit("send_result", key=w.key, ok=False, text="找不到「開新對話」按鈕，請手動開新對話後再送出")
+        why = self._user_guard(w, typing=True, by=by)
+        if why:
+            self._session(w, f"⏳ 延後開新對話：{why}")
             return False
         sess = self._session_for(w)
-        sess.history("action", action="rollover", button=btn.name)
-        time.sleep(2.5)
         st = sess.load()
-        ok = self._do_send(w.key, drv2.build_continuation_prompt(st), by="assistant")
+        if not st.rollover_pending:
+            uw = ud.UiaWindow(w.hwnd)
+            btn = None
+            for name in ("New session", "New Conversation", "New Chat", "新對話"):
+                btn = ud.pick_button(uw.buttons(), name)
+                if btn is not None:
+                    break
+            prev = wu.get_foreground()
+            if btn is None or not ud.invoke(btn.control):
+                self._emit("send_result", key=w.key, ok=False, text="找不到「開新對話」按鈕，請手動開新對話後再送出")
+                return False
+            if prev and prev != w.hwnd and wu.is_window(prev) and wu.get_foreground() == w.hwnd:
+                wu.activate_window(prev)  # 有些 IDE 按下新對話會搶到前景，立刻還給使用者
+            sess.history("action", action="rollover", button=btn.name)
 
-        def mutate(s) -> None:
-            s.rollovers += 1
-            s.recent_tails = []
-            s.add_interaction("rollover", "開新對話並送出接續摘要")
+            def mark(s) -> None:
+                s.rollover_pending = True
+                s.rollovers += 1
+                s.recent_tails = []
+                s.suggested_action = "send_continuation"
+                s.suggested_prompt = drv2.build_continuation_prompt(s)
+                s.suggested_reason = "已開新對話，送出進度摘要接續"
+                s.suggested_at = now_str()
+                s.add_interaction("rollover", "開新對話")
 
-        sess.update(mutate)
-        return ok
+            st = sess.update(mark)
+            time.sleep(2.5)
+        return self._do_send(w.key, st.suggested_prompt or drv2.build_continuation_prompt(st), by=by,
+                             skip_foreground_check=True)
 
     def _maybe_daily_summary(self) -> None:
         today = datetime.date.today().isoformat()
@@ -838,6 +908,12 @@ class AutomationWorker(threading.Thread):
                 sess.history("approval_needed", text=what[:300], buttons=approvals)
                 self._log(f"⏸ [{self._app_name(w)}] 代理在等允許：{what[:80]}")
             self._session(w, f"⏸ 代理在等允許：{what[:50]}｜按「目標／建議」處理")
+            return
+
+        if snap.rollover_pending:
+            sess.update(base, specs, plans)
+            self._session(w, "🔄 已開新對話，等著送出進度摘要")
+            self._maybe_autosend(w)
             return
 
         nothing_new = bool(h) and h == snap.last_panel_hash and bool(snap.suggested_at)
@@ -913,7 +989,7 @@ class AutomationWorker(threading.Thread):
 
     def _set_suggestion(self, w, sess, specs, plans, h, base, record_props, action: str, prompt: str, reason: str,
                         extra=None) -> None:
-        hit = check_deny([prompt], self.cfg.deny_patterns) if prompt else None
+        hit = check_deny([prompt], self.cfg.deny_patterns, allow_negated=True) if prompt else None
         if hit:
             action, prompt, reason = "ask_human", "", f"建議的訊息命中危險規則 /{hit}/"
 
@@ -1017,7 +1093,8 @@ class AutomationWorker(threading.Thread):
         if snap.evidence_requested_at:
             self._verify_report(w, sess, snap, panel_text, judge, args, local)
             return
-        if drv2.is_looping(snap.recent_tails, tail):
+        if len(snap.recent_tails) >= 2 and drv2.is_looping(snap.recent_tails[:-1], snap.recent_tails[-1]) \
+                and drv2.is_looping(snap.recent_tails, tail):
             sess.history("loop", text="代理連續 3 次停在幾乎相同的內容")
             if self._auto_allowed(w) and snap.rollovers < 2:
                 self._set_suggestion(*args, "rollover", drv2.build_continuation_prompt(snap),
@@ -1036,6 +1113,12 @@ class AutomationWorker(threading.Thread):
                        tail: str = "") -> None:
         sug = drv.parse_suggestion(judge.chat(drv.build_suggest_prompt(snap, vs, panel_text, candidates),
                                               max_tokens=1200, temperature=0))
+        if sug["action"] == "approve":
+            # 走到這裡代表畫面上沒有 Allow 類按鈕：代理是用文字在問「可以開始嗎」，改成文字回覆同意
+            sug = dict(sug, action="self_decide",
+                       prompt=("可以，請照你提出的做法開始執行：依驗收條件逐條實作，在功能分支上 commit 並回報 commit hash，"
+                               "不要 push。技術細節請自行判斷最佳做法。"),
+                       reason=(sug["reason"] or "代理在等同意") + "（畫面上沒有允許按鈕，改用文字同意）")
         # 代理宣稱完成時，改用固定格式要求測試報告（含故意弄壞與 commit），不採用模型自由發揮的版本
         if phase_of(snap) == "build" and (sug["action"] == "request_evidence" or sug["new_claims"]):
             report = os.path.join(sess.dir, "reports", drv2.report_filename()) if self._local_path(w) else ""
@@ -1048,15 +1131,13 @@ class AutomationWorker(threading.Thread):
                 st.report_path = report
         else:
             keep_report = None
-        hit = check_deny([sug["prompt"]], self.cfg.deny_patterns) if sug["prompt"] else None
+        hit = check_deny([sug["prompt"]], self.cfg.deny_patterns, allow_negated=True) if sug["prompt"] else None
 
         def with_goal(st) -> None:
             base(st)
             record_props(st)
             st.last_panel_hash = h
             drv.apply_suggestion(st, sug, hit)
-            if tail:
-                st.recent_tails = (st.recent_tails + [tail])[-5:]
             if keep_report:
                 keep_report(st)
             st.add_interaction("suggest", f"{st.suggested_action}：{st.suggested_reason}")
@@ -1075,13 +1156,13 @@ class AutomationWorker(threading.Thread):
         report = drv2.read_new_file(snap.report_path, snap.evidence_requested_at) if snap.report_path else ""
         source = snap.report_path if report else "聊天內容"
         if not report:
-            report = panel_text[-9000:]
+            report = drv2.latest_reply(panel_text)
         repo = self._repo_path(w, snap) if local else ""
         facts = verifier.gather_facts(repo, report) if repo else {"is_repo": False}
         det = verifier.deterministic_issues(facts, report, remote=not local)
         results, issues = drv2.parse_verify(
             judge.chat(drv2.build_verify_prompt(snap, report, verifier.facts_summary(facts), det),
-                       max_tokens=1500, temperature=0), len(snap.acceptance), det)
+                       max_tokens=4000, temperature=0), len(snap.acceptance), det)
         sess.history("verify", source=source, results=[[i, ok, r] for i, ok, r in results], issues=issues,
                      commits=[c.get("hash") for c in facts.get("commits", [])])
 
@@ -1101,12 +1182,14 @@ class AutomationWorker(threading.Thread):
                                        "desc": c.get("subject", "")[:120], "check": check})
             st.last_issues = issues
             st.evidence_requested_at = ""
-            if st.acceptance and all(a.get("status") == "verified" for a in st.acceptance):
+            if st.acceptance and all(a.get("status") == "verified" for a in core_items(st)):
                 st.done_at = now_str()
                 st.autopilot = False
                 st.claims_unverified = []
-                if "目標已達成，請你驗收" not in st.pending_human:
-                    st.pending_human.append("目標已達成，請你驗收")
+                manual = [a["text"] for a in st.acceptance if not is_automated(a)]
+                msg = "目標已達成，請你驗收" + (f"（另有 {len(manual)} 條手動檢查項目請你確認）" if manual else "")
+                if msg not in st.pending_human:
+                    st.pending_human.append(msg)
 
         st = sess.update(apply, self._specs_for(w))
         if st.done_at:
@@ -1128,9 +1211,10 @@ class AutomationWorker(threading.Thread):
                                  f"查核發現 {len(issues)} 個問題，請代理補正",
                                  lambda s, r=report_file: setattr(s, "report_path", r))
             return
-        todo = [a["text"] for a in st.acceptance if a.get("status") != "verified"]
+        todo = [a["text"] for a in core_items(st) if a.get("status") != "verified"]
         prompt = "查核通過的部分已記錄。請在功能分支上繼續處理下一個未完成的驗收條件：\n" + "\n".join(f"- {t}" for t in todo)
-        self._set_suggestion(*args, "next_task", prompt, f"已查核通過 {len(st.acceptance) - len(todo)}/{len(st.acceptance)} 條")
+        n_core = len(core_items(st))
+        self._set_suggestion(*args, "next_task", prompt, f"已查核通過 {n_core - len(todo)}/{n_core} 條核心項目")
 
     # ---- 階段一：UIA 按鈕模式
     def _uia_round(self) -> None:
@@ -1151,6 +1235,11 @@ class AutomationWorker(threading.Thread):
                     continue
                 self._uia_recent[key] = now
                 if not self._still_authorized(w):
+                    break
+                why = self._user_guard(w, typing=False)
+                if why:
+                    self._uia_recent.pop(key, None)
+                    self._session(w, f"⏳ 延後點擊「{b.name}」：{why}")
                     break
                 if ud.invoke(b.control):
                     self._session(w, f"已點擊「{b.name}」")
@@ -1232,7 +1321,7 @@ class AutomationWorker(threading.Thread):
         # 3. 視覺模型判讀
         # 有找到聊天面板就只送面板裁切圖：整個視窗縮圖後小字會糊掉，OCR 抄錯指令的機率高很多
         shot_png = wu.to_png(crop_to_panel(rgb, w.hwnd, panel_rect))
-        raw = vision.chat(build_vision_prompt(app, panel_text), shot_png)
+        raw = vision.chat(build_vision_prompt(app, panel_text), shot_png, max_tokens=2500)
         vs = extract_json(raw)
         if vs is None:
             self._log(f"⚠ [{app}] 視覺模型回覆不是 JSON：{raw[:80]!r}")
@@ -1365,6 +1454,12 @@ class AutomationWorker(threading.Thread):
             return
 
         if plan.kind == "click":
+            why = self._user_guard(w, typing=False)
+            if why:
+                if st.pending is None:
+                    self._log(f"⏳ [{app}] 延後代按「{plan.button}」：{why}")
+                st.pending = plan
+                return
             b = ud.pick_button(buttons, plan.button, panel_rect, fuzzy=True)
             if b is None:
                 self._to_human(w, app, st, f"UIA 找不到按鈕「{plan.button}」", summary, fp_text, fp_img)
@@ -1382,9 +1477,10 @@ class AutomationWorker(threading.Thread):
         if ud.input_has_draft(inp):
             self._to_human(w, app, st, "輸入框內已有文字，避免把草稿一起送出", summary, fp_text, fp_img)
             return
-        if wu.idle_seconds() < self.cfg.ai_idle_sec or wu.modifier_keys_down():
+        why = self._user_guard(w, typing=True)
+        if why:
             if st.pending is None:
-                self._log(f"⏳ [{app}] 等你停止操作 {self.cfg.ai_idle_sec:.0f} 秒後再輸入")
+                self._log(f"⏳ [{app}] 延後輸入：{why}")
             st.pending = plan
             return
         ok, why = self._type_into(w.hwnd, inp, plan.text)
@@ -1442,8 +1538,35 @@ class AutomationWorker(threading.Thread):
             return False, f"{how}後輸入框的內容和預期不同，且無法自動清除，請到 IDE 手動清空輸入框（沒有送出）"
         return True, ""
 
-    def _type_into(self, hwnd: int, inp, text: str) -> Tuple[bool, str]:
+    def _clear_input(self, hwnd: int, inp) -> bool:
         prev = wu.get_foreground()
+        try:
+            if not wu.activate_window(hwnd):
+                return False
+            ud.set_focus(inp)
+            time.sleep(0.15)
+            if not ud.focus_is_within(inp):
+                return False
+            wu.clear_focused_input()
+            return not ud.input_text(inp)
+        finally:
+            if prev and prev != hwnd and wu.is_window(prev):
+                wu.activate_window(prev)
+
+    def _type_into(self, hwnd: int, inp, text: str, watch_user: bool = True) -> Tuple[bool, str]:
+        """切到 IDE、確認焦點在聊天框、貼上、核對、送出，最後把焦點還原。
+
+        watch_user=True 時，每一步之間檢查使用者有沒有開始操作；一旦偵測到就立刻停止並把焦點還給使用者。
+        """
+        mon = wu.InputMonitor.get()
+        t0 = time.monotonic()
+        prev = wu.get_foreground()
+
+        def user_moved() -> bool:
+            return watch_user and mon.real_input_since(t0)
+
+        if user_moved():
+            return False, f"{USER_ABORT}，已取消"
         if not wu.activate_window(hwnd):
             return False, "無法把視窗切到前景"
         try:
@@ -1452,6 +1575,8 @@ class AutomationWorker(threading.Thread):
             for _ in range(3):
                 ud.set_focus(inp)
                 time.sleep(0.15)
+                if user_moved():
+                    return False, f"{USER_ABORT}，已中止（還沒輸入任何文字）"
                 if wu.get_foreground() == hwnd and ud.focus_is_within(inp):
                     focused = True
                     break
@@ -1462,6 +1587,8 @@ class AutomationWorker(threading.Thread):
             ok, why = self._put_text(inp, text)
             if not ok:
                 return False, why
+            if user_moved():
+                return False, f"{USER_ABORT}，已中止（訊息留在輸入框沒有送出，下次會先清掉）"
             # 優先用 UIA 按送出鈕（Kiro 實測按 Enter 有時不會送出）；找不到才按送出鍵
             btn = ud.find_send_button(inp)
             if btn is not None and ud.invoke(btn.control):

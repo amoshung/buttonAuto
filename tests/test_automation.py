@@ -320,3 +320,20 @@ def test_ai_never_clicks_always_allow():
     assert p.kind == "click" and p.button == "Allow"  # 改點一次性的 Allow
     only_always = {"action_buttons": ["Always allow"]}
     assert decide_plan(only_always, _answers("click_button", button="opt_0"), cfg, True).kind == "ask_human"
+
+
+def test_check_deny_negated_mentions_in_outgoing_prompts():
+    pats = AppConfig().deny_patterns
+    assert check_deny(["請在功能分支 commit，不要 git push"], pats, allow_negated=True) is None
+    assert check_deny(["禁止執行 rm -rf build"], pats, allow_negated=True) is None
+    assert check_deny(["do not git push to origin"], pats, allow_negated=True) is None
+    assert check_deny(["請執行 git push origin main"], pats, allow_negated=True)
+    assert check_deny(["不要 push。接著 git push origin main"], pats, allow_negated=True)  # 後面那句是真的要 push
+    assert check_deny(["不要 git push"], pats)  # 代理要執行的指令不考慮否定
+
+
+def test_extract_json_tolerates_paths_and_raw_newlines():
+    raw = '```json\n{"agent_state": "waiting_approval", "command": "$ev = \'D:\\_AI_Projs\\sandbox\'\nGet-ChildItem $ev",}\n```'
+    obj = extract_json(raw)
+    assert obj["agent_state"] == "waiting_approval"
+    assert "D:\\_AI_Projs\\sandbox" in obj["command"] and "\n" in obj["command"]

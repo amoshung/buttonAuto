@@ -86,6 +86,7 @@ class SessionState:
     sends_in_conversation: int = 0
     recent_tails: List[str] = field(default_factory=list)
     rollovers: int = 0
+    rollover_pending: bool = False  # 已開新對話、接續摘要還沒送出
     # 查核用的 git repo（專案根目錄不是 repo、實作在子資料夾時指定）；空字串代表用專案路徑
     repo_path: str = ""
 
@@ -133,7 +134,8 @@ def render_progress(s: SessionState, specs: Optional[List[Dict[str, Any]]] = Non
                 extra.append(f"如何查核：{a['how']}")
             if a.get("test"):
                 extra.append(f"測試：{a['test']}")
-            out.append(f"- [{mark.get(a.get('status', 'todo'), ' ')}] {a.get('text', '')}"
+            tag = "" if is_automated(a) else "👁 手動檢查："
+            out.append(f"- [{mark.get(a.get('status', 'todo'), ' ')}] {tag}{a.get('text', '')}"
                        + (f"（{'；'.join(extra)}）" if extra else ""))
         out.append(f"（{s.acceptance_confirmed_at} 你確認）" if s.acceptance_confirmed_at else "（草稿，等你確認後才開始實作）")
     else:
@@ -284,12 +286,29 @@ def read_plans(project_path: str, limit: int = 10, max_depth: int = 5, head_char
     return out
 
 
+_MANUAL_TEST = re.compile(r"^\s*(無|none|n/?a|-|—)|手動|manual|快照比對|人工", re.I)
+
+
+def is_automated(item: Dict[str, str]) -> bool:
+    """驗收條件是否有自動化測試（測試欄寫了測試名稱或執行指令，且不是「無／手動」）。
+
+    只有自動化項目由助理查核證據；手動項目在目標達成時列給使用者自己確認，避免卡在一份報告證明不了的條件上。
+    """
+    test = (item.get("test") or "").strip()
+    return bool(test) and not _MANUAL_TEST.search(test)
+
+
+def core_items(s: SessionState) -> List[Dict[str, str]]:
+    auto = [a for a in s.acceptance if is_automated(a)]
+    return auto or list(s.acceptance)
+
+
 def phase_of(s: SessionState) -> str:
     if not s.goal:
         return "goal"
     if not s.acceptance_confirmed_at:
         return "spec"
-    if s.done_at or (s.acceptance and all(a.get("status") == "verified" for a in s.acceptance)):
+    if s.done_at or (s.acceptance and all(a.get("status") == "verified" for a in core_items(s))):
         return "done"
     return "build"
 
