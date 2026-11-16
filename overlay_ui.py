@@ -1151,6 +1151,11 @@ class SessionDialog:
         self.approval_btns = tk.Frame(self.approval_box, bg=BG)
         self.approval_btns.pack(fill="x", pady=(4, 0))
 
+        ebox = tk.LabelFrame(body, text=" 🕒 最近發生的事 ", bg=BG, fg="#94A3B8", font=FONT_B, padx=6, pady=4)
+        ebox.pack(fill="x", pady=(0, 4))
+        self.events_lbl = _label(ebox, "", font=FONT_S, wraplength=420, justify="left")
+        self.events_lbl.pack(anchor="w")
+
         sbox = tk.LabelFrame(body, text=" 💡 建議的下一步（只建議，按「送出」才會輸入到 IDE） ", bg=BG, fg="#FBBF24",
                              font=FONT_B, padx=6, pady=4)
         sbox.pack(fill="both", expand=True)
@@ -1173,6 +1178,7 @@ class SessionDialog:
         self.goal_info.configure(text=f"{st.goal_confirmed_at} 確認" if st.goal_confirmed_at else
                                  "尚未設定。進行中的專案可先送出下方的「詢問最終目標」，代理回答後再採用或修改。")
         self._fill_p2(st)
+        self.events_lbl.configure(text="\n".join(self.sess.recent_events(5)) or "（還沒有紀錄）")
         if st.agent_goal_proposal:
             self.proposal_lbl.configure(text=st.agent_goal_proposal)
             self.proposal_box.configure(text=" 🤖 助理推測的目標（按「採用」後可修改） " if

@@ -409,6 +409,32 @@ class Session:
             with open(os.path.join(self.dir, "history.jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+    def recent_events(self, n: int = 5, scan: int = 300) -> List[str]:
+        """最近 n 件值得告訴使用者的事（白話，新的在前）；只讀 history.jsonl 尾端。"""
+        try:
+            with open(os.path.join(self.dir, "history.jsonl"), "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - scan * 600))
+                lines = f.read().decode("utf-8", "replace").splitlines()[-scan:]
+        except OSError:
+            return []
+        out: List[str] = []
+        last = ""
+        for line in reversed(lines):
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            text = describe_event(rec)
+            if not text or text == last:
+                continue
+            last = text
+            out.append(f"{str(rec.get('time', ''))[11:16]} {text}")
+            if len(out) >= n:
+                break
+        return out
+
     def history_on(self, date: str) -> List[Dict[str, Any]]:
         out = []
         try:
@@ -422,6 +448,63 @@ class Session:
         except OSError:
             pass
         return out
+
+
+_AGENT_STATE_TEXT = {"working": "開始工作", "waiting_input": "停下來等指示", "waiting_approval": "等你允許",
+                     "idle": "閒置", "done": "說做完了", "error": "出錯", "asking_choice": "在問要選哪個方案"}
+
+
+def _short(v: Any, n: int = 50) -> str:
+    s = re.sub(r"\s+", " ", str(v or "")).strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def describe_event(rec: Dict[str, Any]) -> str:
+    """把一筆 history 紀錄翻成一句白話；不值得顯示的（例如送出前的意圖）回傳空字串。"""
+    k = rec.get("kind", "")
+    who = "你" if rec.get("by") in ("user", "tester") else "助理"
+    if k == "observe":
+        st = _AGENT_STATE_TEXT.get(rec.get("agent_state", ""), rec.get("agent_state", ""))
+        return f"代理{st}：{_short(rec.get('summary'))}" if st else ""
+    if k == "action":
+        if rec.get("action") == "send":
+            return f"{who}送出：{_short(rec.get('text'), 40)}"
+        if rec.get("action") == "click":
+            return f"{who}代按「{rec.get('button', '')}」"
+        if rec.get("action") == "rollover":
+            return "助理開了新對話接續"
+        text = str(rec.get("text", ""))
+        m = re.search(r"Invoke「(.+?)」", text)
+        return f"助理代按「{m.group(1)}」" if m else f"助理：{_short(text, 40)}"
+    if k == "verify":
+        res = rec.get("results") or []
+        ok = sum(1 for r in res if len(r) > 1 and r[1])
+        return f"查核報告：{ok}/{len(res)} 條有證據" + ("，已向代理要缺的證據" if rec.get("issues") else "")
+    if k == "spec_review":
+        return ("驗收 spec 審查合格" if rec.get("ok") else f"驗收 spec 有 {len(rec.get('issues') or [])} 個問題，請代理修正") \
+            + f"（{rec.get('items', 0)} 條）"
+    simple = {
+        "approval_needed": lambda: f"代理請求允許：{_short(rec.get('text'), 40)}",
+        "suggest": lambda: f"想好下一步：{_short(rec.get('reason'), 40)}",
+        "ask_human": lambda: f"需要你決定：{_short(rec.get('text'), 40)}",
+        "blocked": lambda: f"擋下：{_short(rec.get('text'), 40)}",
+        "loop": lambda: _short(rec.get("text")),
+        "paused": lambda: f"暫停自動駕駛：{_short(rec.get('text'), 40)}",
+        "resume": lambda: "你恢復了自動駕駛",
+        "aborted_by_user": lambda: "你一動就停止輸入，訊息之後重送",
+        "cleared_aborted": lambda: "清掉上次中止留下的半截訊息",
+        "new_goal": lambda: f"開始新目標：{_short(rec.get('goal'), 40)}",
+        "goal": lambda: f"你設定目標：{_short(rec.get('goal'), 40)}",
+        "goal_inferred": lambda: f"推測目標：{_short(rec.get('goal'), 40)}",
+        "proposal": lambda: "代理說明了最終目標，等你採用",
+        "new_work_detected": lambda: f"偵測到新工作：{_short(rec.get('task'), 40)}",
+        "spec_confirmed": lambda: f"{who}確認了驗收 spec",
+        "manual_check": lambda: "你勾選了手動檢查項目",
+        "docs": lambda: "更新了正在進行的計畫文件",
+        "user_answer": lambda: f"{who}回覆：{_short(rec.get('text'), 40)}",
+    }
+    f = simple.get(k)
+    return f() if f else ""
 
 
 class SessionStore:

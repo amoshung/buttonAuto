@@ -242,3 +242,20 @@ def test_panel_hash_ignores_relative_timestamps():
     c = "代理：完成了，另外還有一件事\n5m ago"
     assert drv.panel_hash(a) == drv.panel_hash(b)
     assert drv.panel_hash(a) != drv.panel_hash(c)
+
+
+def test_recent_events_plain_language_newest_first(tmp_path):
+    from sessions import describe_event
+    s = _store(tmp_path).get("kiro|d:\\a\\p", "Kiro", "p", "D:\\a\\p")
+    s.history("intent", action="send", text="x", by="assistant")  # 意圖不顯示
+    s.history("observe", agent_state="waiting_input", summary="做完第一段")
+    s.history("action", text="🖱 Invoke「Allow」")
+    s.history("action", text="🖱 Invoke「Allow」")  # 連續重複只顯示一次
+    s.history("verify", results=[[1, True, "a"], [2, False, "b"]], issues=["缺"])
+    ev = s.recent_events(5)
+    assert len(ev) == 3
+    assert "查核報告：1/2" in ev[0]
+    assert ev[1].endswith("助理代按「Allow」")
+    assert "代理停下來等指示：做完第一段" in ev[2]
+    assert describe_event({"kind": "intent"}) == ""
+    assert describe_event({"kind": "action", "action": "send", "text": "hi", "by": "user"}) == "你送出：hi"
