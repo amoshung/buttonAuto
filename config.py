@@ -48,6 +48,11 @@ def _default_deny_patterns() -> List[str]:
         r"\breg\s+delete\b",
         r"\bmkfs\b",
         r"\bdd\s+if=",
+        # 安裝或移除套件、改系統環境：一律交給使用者
+        r"\b(pip|pip3|conda|mamba|uv)\s+(install|uninstall|remove)\b",
+        r"\b(apt|apt-get|yum|dnf|zypper|brew|choco|winget|scoop)\s+(install|remove|uninstall|upgrade)\b",
+        r"\bnpm\s+(i|install)\b.*(-g|--global)\b",
+        r"\bInstall-(Module|Package)\b",
     ]
 
 
@@ -85,6 +90,8 @@ class AppConfig:
     ai_dry_run: bool = True
     ai_min_confidence: float = 0.6
     ai_max_risk: float = 0.3
+    # 風險落在 ai_max_risk ~ ai_risk_review_max 之間時，先請判斷模型逐行審查指令（第二意見），兩者都說安全才代按
+    ai_risk_review_max: float = 0.7
     # 鍵盤與滑鼠都停止這麼多秒後才會點擊或打字（讀畫面不受限）
     ai_idle_sec: float = 5.0
     ai_recheck_sec: float = 60.0
@@ -139,9 +146,10 @@ class AppConfig:
             cfg.mode = "ai"
         if cfg.basic_mode not in ("image", "uia"):
             cfg.basic_mode = "uia"
-        # Q12（2026-11-16）：一般 push 也交給使用者。舊設定檔只擋強制推送，補上這條
-        if r"git\s+push\b" not in cfg.deny_patterns:
-            cfg.deny_patterns.append(r"git\s+push\b")
+        # 舊設定檔沒有的新規則補上（使用者自己加的規則不動）
+        for p in _default_deny_patterns():
+            if p not in cfg.deny_patterns:
+                cfg.deny_patterns.append(p)
         return cfg
 
     def is_authorized(self, key: str) -> bool:

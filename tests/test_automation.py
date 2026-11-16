@@ -337,3 +337,40 @@ def test_extract_json_tolerates_paths_and_raw_newlines():
     obj = extract_json(raw)
     assert obj["agent_state"] == "waiting_approval"
     assert "D:\\_AI_Projs\\sandbox" in obj["command"] and "\n" in obj["command"]
+
+
+def test_decide_approval_paths():
+    from automation import decide_approval, one_time_allow_button
+    cfg = AppConfig()
+    btns = ["Deny", "Always allow", "Allow", "Always deny"]
+    assert one_time_allow_button(btns) == "Allow"
+    assert one_time_allow_button(["Always allow", "Deny"]) is None
+    ans = lambda allow, risk: {"allow": {"noul": allow}, "risk": {"noul": risk}}
+    p, need = decide_approval(ans(0.95, 0.1), None, btns, cfg)
+    assert p.kind == "click" and p.button == "Allow" and not need
+    p, need = decide_approval(ans(0.95, 0.5), None, btns, cfg)
+    assert p.kind == "wait" and need  # 灰色地帶：先拿第二意見
+    p, _ = decide_approval(ans(0.95, 0.5), (0.1, True, "只讀取檔案"), btns, cfg)
+    assert p.kind == "click" and "第二意見" in p.reason
+    p, _ = decide_approval(ans(0.95, 0.5), (0.6, True, "會刪檔"), btns, cfg)
+    assert p.kind == "ask_human"
+    p, _ = decide_approval(ans(0.95, 0.5), (0.1, False, "範圍外"), btns, cfg)
+    assert p.kind == "ask_human"
+    assert decide_approval(ans(0.95, 0.9), None, btns, cfg)[0].kind == "ask_human"
+    assert decide_approval(ans(0.1, 0.5), None, btns, cfg)[0].kind == "ask_human"
+    assert decide_approval(ans(0.3, 0.1), None, btns, cfg)[1] is True  # 不確定但風險低：先拿第二意見
+    assert decide_approval({}, None, btns, cfg)[0].kind == "ask_human"  # 缺資料一律保守
+    assert decide_approval(ans(0.95, 0.1), None, ["Always allow"], cfg)[0].kind == "ask_human"
+
+
+def test_decide_plan_uses_p_human_not_top_confidence():
+    cfg = AppConfig()
+    spread = {"action": {"choice": "click_button", "confidence": 0.45,
+                         "probabilities": {"click_button": 0.45, "continue": 0.35, "reply": 0.1, "ask_human": 0.05,
+                                           "wait": 0.05}},
+              "risk": {"noul": 0.05}, "button": {"choice": "opt_0", "confidence": 0.9}}
+    p = decide_plan({"action_buttons": ["Submit"]}, spread, cfg, True)
+    assert p.kind == "click" and p.scores["p_human"] == 0.05
+    worried = dict(spread, action={"choice": "click_button", "confidence": 0.5,
+                                   "probabilities": {"click_button": 0.5, "ask_human": 0.45}})
+    assert decide_plan({"action_buttons": ["Submit"]}, worried, cfg, True).kind == "ask_human"
