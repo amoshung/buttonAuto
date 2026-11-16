@@ -25,6 +25,7 @@ from sessions import SessionStore, phase_label, phase_of, core_items, is_automat
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 _STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
            "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+           "/office.js": ("office.js", "text/javascript; charset=utf-8"),
            "/style.css": ("style.css", "text/css; charset=utf-8")}
 _APP_AVATAR = {"Kiro": "👻", "Antigravity": "🚀"}
 _STATE_AVATAR = {"working": "⌨️", "waiting_approval": "🙋", "asking_choice": "🙋", "waiting_input": "💬",

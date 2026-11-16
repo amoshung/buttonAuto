@@ -19,6 +19,7 @@ function renderAgents(agents) {
   for (const a of agents) {
     const hand = (a.needs_you.length || a.paused) && a.mode !== "off";
     const card = el("div", `card ${a.mode}${hand ? " hand" : ""}`);
+    card.dataset.key = a.key;
     const who = el("div", "who");
     const av = el("div", "avatar", a.avatar);
     av.append(el("span", "mood", hand ? "🙋" : a.mood));
@@ -130,6 +131,7 @@ function render(s) {
   run.textContent = s.running ? "🟢 運作中" : "⏸ 已全部暫停（F8）";
   run.className = "pill " + (s.running ? "ok" : "bad");
   renderAgents(s.agents);
+  if (window.Office) window.Office.update(s.agents);
   renderDecisions(s.decisions);
   renderFeed(s.feed);
   renderUsage(s.usage, s.agents);
