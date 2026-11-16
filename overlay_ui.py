@@ -116,8 +116,12 @@ class FloatingOverlayApp:
         self.dashboard: Optional[Dashboard] = None
         if self.cfg.dashboard_enabled:
             try:
-                self.dashboard = Dashboard(self.worker, self.cfg, int(self.cfg.dashboard_port),
-                                           running=lambda: self.is_running).start()
+                # 網頁上的切換模式／全部暫停：交給 Tk 主執行緒處理（和桌面版按下去走同一段程式）
+                self.dashboard = Dashboard(
+                    self.worker, self.cfg, int(self.cfg.dashboard_port), running=lambda: self.is_running,
+                    on_mode=lambda key, mode: self.events.put({"type": "web_mode", "key": key, "mode": mode}),
+                    on_running=lambda run: self.events.put({"type": "web_running", "running": run}),
+                ).start()
             except OSError as e:
                 self.events.put({"type": "log", "text": f"⚠ 網頁儀表板無法啟動：{e}"})
         self.click_count = 0
@@ -978,6 +982,12 @@ class FloatingOverlayApp:
                 dlg = self._dialogs.get(ev["key"])
                 if dlg is not None and dlg.win.winfo_exists():
                     dlg.reload(full=False)
+            elif kind == "web_mode":
+                if ev.get("mode") in MODE_TEXT:
+                    self.set_session_mode(ev["key"], ev["mode"])
+            elif kind == "web_running":
+                if bool(ev.get("running")) != self.is_running:
+                    self.toggle_running()
             elif kind == "modes_changed":
                 self._session_sig = ()
                 self._refresh_sessions()

@@ -88,3 +88,11 @@ Electron 類 IDE 在第一次被 UIA 查詢後才開放無障礙樹，剛啟動�
 - 多螢幕、多掃描區域框、滑鼠可穿透的綠色提示框。
 - 面板內截圖新增目標按鈕，自動排除面板本身的範圍。
 - Per-Monitor 高 DPI 感知。
+
+## 像素辦公室（網頁儀表板）
+
+主視窗標題列的「🌐」會打開像素辦公室：每個開著的 IDE 視窗是一位同事，狀態用動作表示（打字＝工作中、舉手＝需要你、去茶水間＝閒置、坐著暫停＝模式關閉）。點同事可以看目標與進度、切換模式、代按代理在等的按鈕、打字傳話給代理、請助理開新對話接續。右上角「全部暫停」等同 F8。舊的清單式畫面在 `/classic/`。
+
+- 介面原始碼在 `pixeloffice/`（Next.js，改自 [amoshung/pixeloffice_y6p2](https://github.com/amoshung/pixeloffice_y6p2)），建置結果已放在 `web/pixel/`，執行助理不需要 Node。
+- 修改介面後重新建置：`cd pixeloffice && npm install && npm run build`（會更新 `web/pixel/`）。
+- 資料與動作由 `office_bridge.py` 轉接：只綁 127.0.0.1、需要存取碼；網頁上的按鈕只接受代理當下列出的選項，實際操作與桌面版走同一套規則。

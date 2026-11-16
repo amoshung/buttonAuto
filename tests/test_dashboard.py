@@ -83,8 +83,15 @@ def test_requires_token_and_local_host(dash):
     cookie = {"Cookie": f"aea_t={dash.token}"}
     r, data = _req(dash, "GET", "/api/state", headers=cookie)
     assert r.status == 200 and json.loads(data)["agents"]
-    r, data = _req(dash, "GET", "/", headers=cookie)
-    assert r.status == 200 and dash.token.encode() in data and "default-src 'self'" in r.getheader("Content-Security-Policy")
+    r, data = _req(dash, "GET", "/", headers=cookie)  # 像素辦公室
+    assert r.status == 200 and dash.token.encode() in data and b"__TOKEN__" not in data
+    assert "frame-ancestors 'none'" in r.getheader("Content-Security-Policy")
+    r, data = _req(dash, "GET", "/classic/", headers=cookie)  # 經典版
+    assert r.status == 200 and "script-src" not in r.getheader("Content-Security-Policy")
+    r, _ = _req(dash, "GET", "/..%2F..%2Fsecrets.local.json", headers=cookie)
+    assert r.status == 404
+    r, _ = _req(dash, "GET", "/../config.py", headers=cookie)
+    assert r.status == 404
 
 
 def test_decide_requires_header_token_and_listed_button(dash):
@@ -103,7 +110,7 @@ def test_decide_requires_header_token_and_listed_button(dash):
 
 def test_office_script_is_served(dash):
     cookie = {"Cookie": f"aea_t={dash.token}"}
-    r, data = _req(dash, "GET", "/office.js", headers=cookie)
+    r, data = _req(dash, "GET", "/classic/office.js", headers=cookie)
     assert r.status == 200 and b"window.Office" in data
-    r, data = _req(dash, "GET", "/", headers=cookie)
-    assert b'id="office-canvas"' in data and b"/office.js" in data
+    r, data = _req(dash, "GET", "/classic/", headers=cookie)
+    assert b'id="office-canvas"' in data and b"office.js" in data
