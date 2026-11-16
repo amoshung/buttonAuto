@@ -86,6 +86,8 @@ class SessionState:
     report_wait_hash: str = ""  # 報告還沒寫完時上一輪看到的內容指紋（連續兩輪不變才查核）  # 曾經在報告中看到「故意弄壞」的結果（之後的補正報告不必重做）
     last_issues: List[str] = field(default_factory=list)
     done_at: str = ""
+    done_hash: str = ""      # 達成目標當下的聊天內容指紋；之後內容變了，代表代理在做新的工作
+    goal_source: str = ""    # user / agent / inferred
     # 對話過長、原地打轉
     sends_in_conversation: int = 0
     recent_tails: List[str] = field(default_factory=list)
@@ -373,6 +375,29 @@ class Session:
             mutate(st)
             self.save(st, specs, plans)
             return st
+
+    def start_new_goal(self, goal: str = "", source: str = "user") -> SessionState:
+        """封存目前的進度（state.json 與 progress.md 複製到 archive/），換成新的目標從頭開始。"""
+        with self._lock:
+            old = self.load()
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            arch = os.path.join(self.dir, "archive")
+            os.makedirs(arch, exist_ok=True)
+            with open(os.path.join(arch, f"state-{stamp}.json"), "w", encoding="utf-8") as f:
+                json.dump(asdict(old), f, ensure_ascii=False, indent=2)
+            if os.path.exists(self.progress_path):
+                with open(self.progress_path, encoding="utf-8") as src, \
+                        open(os.path.join(arch, f"progress-{stamp}.md"), "w", encoding="utf-8") as dst:
+                    dst.write(src.read())
+            new = SessionState(key=old.key, app=old.app, project=old.project, path=old.path, remote=old.remote,
+                               repo_path=old.repo_path, active_docs=list(old.active_docs),
+                               active_docs_by=old.active_docs_by)
+            new.goal, new.goal_source = goal, source if goal else ""
+            new.goal_confirmed_at = now_str() if goal else ""
+            new.add_interaction("new_goal", f"封存 {stamp}，開始新目標：{goal[:100] or '（未設定）'}")
+            self.save(new)
+        self.history("new_goal", archived=stamp, goal=goal, source=source)
+        return new
 
     def history(self, kind: str, **data: Any) -> None:
         rec = {"time": now_str(), "kind": kind}

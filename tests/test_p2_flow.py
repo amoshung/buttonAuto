@@ -209,3 +209,49 @@ def test_followup_lists_only_gaps():
     assert f.startswith(drv2.REPORT_MARK) and "1. 補 exit code" in f and drv2.REPORT_DONE in f
     assert "故意弄壞" not in f and "逐條對照" not in f  # 不重複整份報告格式
     assert len(f) < 200
+
+
+class InferJudge(FakeJudge):
+    def chat(self, prompt, image_png=None, max_tokens=0, temperature=None):
+        self.calls.append(prompt[:40])
+        if "推測這個專案目前開發的最終目標" in prompt:
+            return json.dumps({"goal": "完成 U2 第二段 API", "current_task": "實作 /api/system/settings", "main_doc": ""},
+                              ensure_ascii=False)
+        return super().chat(prompt, image_png, max_tokens, temperature)
+
+
+def _done_session(tmp_path, mode):
+    w = _worker(tmp_path)
+    pw = ProjectWindow(1, "kiro", "Kiro", "t", "proj", "", "", False, False)
+    sess = w._session_for(pw)
+
+    def setup(st):
+        st.goal, st.acceptance_confirmed_at, st.done_at = "舊目標", now_str(), now_str()
+        st.acceptance = [{"text": "A", "test": "t", "status": "verified"}]
+    sess.update(setup)
+    w.cfg.set_mode(pw.key, mode)
+    return w, pw, sess
+
+
+def test_after_done_new_work_autopilot_starts_new_goal(tmp_path):
+    w, pw, sess = _done_session(tmp_path, "auto")
+    judge = InferJudge()
+    stopped = {"agent_state": "waiting_input", "summary": "代理問下一步"}
+    w._drive(pw, stopped, "完成的對話", judge)       # 記下達成時的內容
+    w._drive(pw, stopped, "完成的對話", judge)       # 沒有新內容：不動
+    assert sess.load().goal == "舊目標"
+    w._drive(pw, stopped, "新的對話：U2 第一段完成，要繼續嗎？", judge)
+    st = sess.load()
+    assert st.goal == "完成 U2 第二段 API" and st.goal_source == "inferred" and not st.done_at
+    assert st.current_task.startswith("實作") and any("確認新目標" in p for p in st.pending_human)
+    assert os.listdir(os.path.join(sess.dir, "archive"))  # 舊進度有封存
+
+
+def test_after_done_new_work_suggest_mode_only_offers(tmp_path):
+    w, pw, sess = _done_session(tmp_path, "suggest")
+    judge = InferJudge()
+    stopped = {"agent_state": "waiting_input", "summary": "停"}
+    w._drive(pw, stopped, "完成的對話", judge)
+    w._drive(pw, stopped, "新的對話", judge)
+    st = sess.load()
+    assert st.goal == "舊目標" and st.suggested_action == "new_goal" and "U2" in st.agent_goal_proposal

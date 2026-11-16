@@ -1102,14 +1102,54 @@ class AutomationWorker(threading.Thread):
 
         phase = phase_of(snap)
         if phase == "done":
-            sess.update(base, specs, plans)
-            self._session(w, "🎉 目標已達成並查核通過，助理不再推進")
+            self._drive_after_done(w, sess, snap, agent_state, panel_text, judge, specs, plans, candidates, h, base)
             return
         if phase == "spec":
             self._drive_spec(w, sess, snap, panel_text, judge, specs, plans, candidates, h, base, record_props)
         else:
             self._drive_build(w, sess, snap, vs, panel_text, judge, specs, plans, candidates, h, base, record_props)
         self._maybe_autosend(w)
+
+    def _drive_after_done(self, w, sess, snap, agent_state, panel_text, judge, specs, plans, candidates, h, base) -> None:
+        """目標已達成之後：聊天內容有新進展（代理在做別的工作、在問你下一步），就準備新目標，而不是一直顯示「已達成」。"""
+        if not snap.done_hash:
+            sess.update(lambda s: (base(s), setattr(s, "done_hash", h)), specs, plans)
+            self._session(w, "🎉 目標已達成並查核通過")
+            return
+        if not h or h == snap.done_hash or agent_state == "working":
+            sess.update(base, specs, plans)
+            self._session(w, "🎉 目標已達成並查核通過" + ("（代理在工作中）" if agent_state == "working" else ""))
+            return
+        if snap.suggested_action == "new_goal" and snap.last_panel_hash == h:
+            return
+        g, task, doc = drv.parse_goal_infer(
+            judge.chat(drv.build_goal_infer_prompt(panel_text, candidates), max_tokens=700, temperature=0), candidates)
+        sess.history("new_work_detected", goal=g, task=task)
+        if self.cfg.mode_of(w.key) == "auto" and g:
+            # 自動駕駛：先採用推測的新目標繼續推進；驗收 spec 仍要你確認才會開始實作
+            new = sess.start_new_goal(g, source="inferred")
+
+            def note(s, task=task, doc=doc) -> None:
+                s.current_task = task
+                s.pending_human.append("確認新目標（已先採用助理的推測，可在詳情修改）")
+                if doc and not s.active_docs:
+                    s.agent_active_docs_proposal = [doc]
+            sess.update(note, specs, plans)
+            self._log(f"🆕 [{self._app_name(w)}] 偵測到新工作，已開始新目標：{g[:60]}")
+            self._session(w, f"🆕 偵測到新工作，已開始新目標：{(task or g)[:50]}（詳情可修改）")
+            self._emit("humans", items=self.human_list(), alert=True)
+            return
+
+        def offer(s, g=g, task=task) -> None:
+            base(s)
+            s.last_panel_hash = h
+            s.current_task = task
+            s.agent_goal_proposal = (drv.INFERRED_PREFIX + g) if g else ""
+            s.suggested_action, s.suggested_prompt = "new_goal", ""
+            s.suggested_reason = f"代理在做新的工作：{task or '（看不出來）'}；在詳情按「開始新目標」"
+            s.suggested_at = now_str()
+        sess.update(offer, specs, plans)
+        self._session(w, f"🆕 代理在做新的工作：{(task or '看不出來')[:40]}｜按「詳情」→「開始新目標」")
 
     def _set_suggestion(self, w, sess, specs, plans, h, base, record_props, action: str, prompt: str, reason: str,
                         extra=None) -> None:
@@ -1216,6 +1256,10 @@ class AutomationWorker(threading.Thread):
         local = self._local_path(w)
         if snap.evidence_requested_at:
             self._verify_report(w, sess, snap, panel_text, judge, args, local)
+            return
+        if re.search(r"(請|please)?\s*(執行|run|輸入|type)?\s*`?/clear`?", tail, re.I) and re.search(r"繼續|continue", tail, re.I):
+            self._set_suggestion(*args, "rollover", drv2.build_continuation_prompt(snap),
+                                 "代理要求清空對話後再繼續：開新對話並送出進度摘要")
             return
         if len(snap.recent_tails) >= 2 and drv2.is_looping(snap.recent_tails[:-1], snap.recent_tails[-1]) \
                 and drv2.is_looping(snap.recent_tails, tail):

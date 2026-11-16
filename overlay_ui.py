@@ -350,7 +350,13 @@ class FloatingOverlayApp:
     def _open_session_dialog(self, pw: ProjectWindow) -> None:
         old = self._dialogs.get(pw.key)
         if old is not None and old.win.winfo_exists():
+            # 已經開過：可能被縮小或藏在其他視窗後面，還原並拉到最前面（使用者自己按的，搶焦點沒關係）
+            old.win.deiconify()
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            if not (0 <= old.win.winfo_x() < sw and 0 <= old.win.winfo_y() < sh):
+                old.win.geometry(f"+{max(0, self.root.winfo_rootx() - 470)}+{max(0, self.root.winfo_rooty())}")
             old.win.lift()
+            old.win.focus_force()
             old.reload()
             return
         self._dialogs[pw.key] = SessionDialog(self, pw)
@@ -1065,6 +1071,7 @@ class SessionDialog:
         self.confirm_btn.pack(side="left")
         self.rollover_btn = _button(arow, "🔄 開新對話並送出", self.rollover)
         self.rollover_btn.pack(side="left", padx=6)
+        _button(arow, "🆕 開始新目標", self.new_goal, bg="#B45309").pack(side="left")
         _button(arow, "報告資料夾", lambda: FloatingOverlayApp._open_path(self.sess.reports_dir)).pack(side="right")
 
         self.proposal_box = tk.LabelFrame(body, text=" 🤖 代理說明的最終目標（待你採用） ", bg=BG, fg="#A78BFA",
@@ -1228,6 +1235,19 @@ class SessionDialog:
         self.sess.history("spec_confirmed", by="user")
         self.result_lbl.configure(text="已確認驗收 spec。下方是開始實作的訊息，可以修改後送出（自動駕駛開著會自動送出）。",
                                   fg="#34D399")
+        self.reload()
+
+    def new_goal(self) -> None:
+        st = self.sess.load()
+        typed = self.goal_text.get("1.0", "end").strip()
+        proposal = st.agent_goal_proposal.replace("（助理依計畫文件與聊天推測，請確認）", "").strip()
+        goal = typed if typed and typed != st.goal else proposal
+        msg = ("目前的進度會封存到 archive/，換成新目標從頭開始。\n\n新目標：\n"
+               + (goal[:300] or "（先空白，之後再輸入或讓助理詢問代理）"))
+        if not messagebox.askyesno("開始新目標", msg, parent=self.win):
+            return
+        self.sess.start_new_goal(goal, source="user" if goal == typed else "inferred")
+        self.result_lbl.configure(text="已封存舊進度並開始新目標。", fg="#34D399")
         self.reload()
 
     def rollover(self) -> None:
