@@ -6,6 +6,7 @@
 import base64
 import json
 import re
+import threading
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -39,6 +40,21 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+_CALLS: Dict[str, int] = {}
+_CALLS_LOCK = threading.Lock()
+
+
+def count_call(name: str) -> None:
+    """模型呼叫次數（給儀表板的用量顯示）；只計數，不記內容。"""
+    with _CALLS_LOCK:
+        _CALLS[name] = _CALLS.get(name, 0) + 1
+
+
+def call_counts() -> Dict[str, int]:
+    with _CALLS_LOCK:
+        return dict(_CALLS)
+
+
 def _join(base_url: str, path: str) -> str:
     return base_url.rstrip("/") + path
 
@@ -54,6 +70,7 @@ class VisionClient:
              temperature: Optional[float] = None) -> str:
         if not self.base_url or not self.api_key:
             raise AIError("視覺模型尚未設定 Base URL 或金鑰")
+        count_call(self.model + ("（含圖）" if image_png else ""))
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         if image_png:
             b64 = base64.b64encode(image_png).decode("ascii")
@@ -93,6 +110,7 @@ class DecisionClient:
         """回傳 answers 字典：answers[<名稱>] 內含 noul 機率或 choice/confidence/probabilities。"""
         if not self.base_url or not self.api_key:
             raise AIError("Decision-1 尚未設定 Base URL 或金鑰")
+        count_call(self.model)
         payload = {"model": self.model, "state": state, "questions": questions}
         try:
             r = requests.post(

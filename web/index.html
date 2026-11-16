@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="aea-token" content="__TOKEN__">
+<title>AI 工程助理｜辦公室</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>🤖 AI 工程助理｜辦公室</h1>
+  <span id="conn" class="pill">連線中…</span>
+  <span id="running" class="pill"></span>
+  <span id="clock" class="dim"></span>
+</header>
+<main>
+  <section id="col-agents">
+    <h2>同事</h2>
+    <div id="agents"></div>
+  </section>
+  <section id="col-middle">
+    <h2>🙋 需要你決定</h2>
+    <div id="decisions"></div>
+    <h2>🕒 動態</h2>
+    <ol id="feed"></ol>
+  </section>
+  <section id="col-usage">
+    <h2>📊 今天的用量</h2>
+    <div id="usage"></div>
+  </section>
+</main>
+<div id="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

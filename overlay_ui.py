@@ -14,6 +14,7 @@ import win_utils as wu
 from ai_client import AIError
 from ai_settings import AISettings, DEFAULT_SECRETS_PATH
 from automation import AutomationWorker, make_clients
+from dashboard import Dashboard
 from config import AppConfig, DEFAULT_CONFIG_PATH
 from projects import ProjectDetector, ProjectWindow, contains_assistant
 from driver import build_docs_question, build_goal_question, doc_candidates
@@ -111,6 +112,13 @@ class FloatingOverlayApp:
         self.worker.start()
 
         self.is_running = False
+        self.dashboard: Optional[Dashboard] = None
+        if self.cfg.dashboard_enabled:
+            try:
+                self.dashboard = Dashboard(self.worker, self.cfg, int(self.cfg.dashboard_port),
+                                           running=lambda: self.is_running).start()
+            except OSError as e:
+                self.events.put({"type": "log", "text": f"⚠ 網頁儀表板無法啟動：{e}"})
         self.click_count = 0
         self.last_scan_time = 0.0
         self.is_collapsed = False
@@ -166,6 +174,9 @@ class FloatingOverlayApp:
                                       activeforeground="#FFFFFF", bd=0, font=("Segoe UI", 10, "bold"), width=3,
                                       command=self._toggle_collapse)
         self.collapse_btn.pack(side="right", padx=2)
+        tk.Button(self.title_bar, text="🌐", bg=BG2, fg=FG_DIM, activebackground="#334155", activeforeground="#FFFFFF",
+                  bd=0, font=("Segoe UI Emoji", 10), width=3, cursor="hand2",
+                  command=self._open_dashboard).pack(side="right", padx=2)
         for widget in (self.title_bar, self.title_lbl):
             widget.bind("<ButtonPress-1>", self._start_drag)
             widget.bind("<B1-Motion>", self._on_drag)
@@ -1034,7 +1045,16 @@ class FloatingOverlayApp:
         ny = self.root.winfo_y() + event.y - self._drag_offset[1]
         self.root.geometry(f"+{nx}+{ny}")
 
+    def _open_dashboard(self) -> None:
+        if self.dashboard is None:
+            messagebox.showinfo(APP_NAME, "網頁儀表板沒有啟動（可能是設定關閉或連接埠被占用），請看「日誌」。")
+            return
+        import webbrowser
+        webbrowser.open(self.dashboard.url)
+
     def _on_close(self) -> None:
+        if self.dashboard is not None:
+            self.dashboard.stop()
         self.worker.stop()
         self.border_mgr.clear()
         self.cfg.save(self.config_path)

@@ -114,6 +114,9 @@ class AppConfig:
     notify_enabled: bool = True
     # UIA 讀得到足夠的面板文字時先不送截圖，看不出狀態才用視覺模型
     ai_text_first: bool = True
+    # 網頁儀表板：只綁 127.0.0.1；連接埠 0 代表每次啟動隨機挑一個空的
+    dashboard_enabled: bool = True
+    dashboard_port: float = 0.0
     # P2 自動駕駛（各工作階段另外要打開「自動駕駛」才會生效）
     autopilot_max_per_hour: float = 12.0
     evidence_max_attempts: float = 3.0

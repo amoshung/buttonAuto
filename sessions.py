@@ -13,7 +13,7 @@ import os
 import re
 import threading
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
@@ -410,7 +410,11 @@ class Session:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def recent_events(self, n: int = 5, scan: int = 300) -> List[str]:
-        """最近 n 件值得告訴使用者的事（白話，新的在前）；只讀 history.jsonl 尾端。"""
+        """最近 n 件值得告訴使用者的事（白話，新的在前）。"""
+        return [f"{t[11:16]} {text}" for t, _k, text in self.recent_records(n, scan)]
+
+    def recent_records(self, n: int = 5, scan: int = 300) -> List[Tuple[str, str, str]]:
+        """(時間, 種類, 白話描述)，新的在前；只讀 history.jsonl 尾端。"""
         try:
             with open(os.path.join(self.dir, "history.jsonl"), "rb") as f:
                 f.seek(0, os.SEEK_END)
@@ -419,7 +423,7 @@ class Session:
                 lines = f.read().decode("utf-8", "replace").splitlines()[-scan:]
         except OSError:
             return []
-        out: List[str] = []
+        out: List[Tuple[str, str, str]] = []
         last = ""
         for line in reversed(lines):
             try:
@@ -430,7 +434,7 @@ class Session:
             if not text or text == last:
                 continue
             last = text
-            out.append(f"{str(rec.get('time', ''))[11:16]} {text}")
+            out.append((str(rec.get("time", "")), str(rec.get("kind", "")), text))
             if len(out) >= n:
                 break
         return out

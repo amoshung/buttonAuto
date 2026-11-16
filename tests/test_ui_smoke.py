@@ -30,7 +30,7 @@ def app(tmp_path_factory):
                                       secrets_path=str(tmp / "secrets.json"))
     root.update()
     yield a
-    root.destroy()
+    a._on_close()
     mp.undo()
 
 
