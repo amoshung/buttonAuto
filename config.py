@@ -112,6 +112,8 @@ class AppConfig:
     daily_summary_time: str = "18:00"
     # 「需要你決定」與每日摘要跳 Windows 通知
     notify_enabled: bool = True
+    # UIA 讀得到足夠的面板文字時先不送截圖，看不出狀態才用視覺模型
+    ai_text_first: bool = True
     # P2 自動駕駛（各工作階段另外要打開「自動駕駛」才會生效）
     autopilot_max_per_hour: float = 12.0
     evidence_max_attempts: float = 3.0

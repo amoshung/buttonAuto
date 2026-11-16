@@ -397,3 +397,10 @@ def test_asks_clear():
     from automation import asks_clear
     assert asks_clear("context 已接近 60%，請執行 /clear。/clear 之後告訴我「繼續」")
     assert not asks_clear("我會先清掉暫存檔再繼續")
+
+
+def test_text_prompt_lists_panel_buttons_and_unknown_fallback():
+    from automation import build_text_prompt, AGENT_STATES
+    p = build_text_prompt("Kiro", "代理問：要繼續嗎？", ["Allow", "Deny"])
+    assert "Allow、Deny" in p and '"unknown"' in p and '"agent_state"' in p
+    assert "unknown" not in AGENT_STATES  # 回 unknown 就會改用截圖
