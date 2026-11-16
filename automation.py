@@ -1010,6 +1010,11 @@ class AutomationWorker(threading.Thread):
             self._maybe_autosend(w)
             return
 
+        if snap.paused_reason:
+            sess.update(base, specs, plans)
+            self._session(w, f"⏸ 已暫停：{snap.paused_reason}（在詳情按「恢復自動駕駛」，或改模式）")
+            return
+
         nothing_new = bool(h) and h == snap.last_panel_hash and bool(snap.suggested_at)
         if agent_state == "working" or not self.cfg.driver_enabled or nothing_new:
             sess.update(base, specs, plans)
@@ -1251,6 +1256,12 @@ class AutomationWorker(threading.Thread):
         source = snap.report_path if report else "聊天內容"
         if not report:
             report = drv2.latest_reply(panel_text)
+        if not drv2.report_finished(report):
+            rh = drv.panel_hash(report)
+            if not report.strip() or rh != snap.report_wait_hash or snap.agent_state == "working":
+                sess.update(lambda s, rh=rh: setattr(s, "report_wait_hash", rh))
+                self._session(w, "⏳ 等代理寫完測試報告（看到「【報告完畢】」或內容不再變動才查核）")
+                return
         repo = self._repo_path(w, snap) if local else ""
         facts = verifier.gather_facts(repo, report) if repo else {"is_repo": False}
         mutation_now = verifier.has_mutation_evidence(report)
@@ -1278,6 +1289,7 @@ class AutomationWorker(threading.Thread):
                                        "desc": c.get("subject", "")[:120], "check": check})
             st.last_issues = issues
             st.evidence_requested_at = ""
+            st.report_wait_hash = ""
             if mutation_now and not st.mutation_seen_at:
                 st.mutation_seen_at = now_str()
             if st.acceptance and all(a.get("status") == "verified" for a in core_items(st)):
@@ -1308,7 +1320,7 @@ class AutomationWorker(threading.Thread):
             report_file = os.path.join(sess.dir, "reports", drv2.report_filename()) if local else ""
             if report_file:
                 os.makedirs(os.path.dirname(report_file), exist_ok=True)
-            self._set_suggestion(*args, "request_evidence", drv2.build_evidence_request(st, report_file, issues),
+            self._set_suggestion(*args, "request_evidence", drv2.build_evidence_followup(issues, report_file),
                                  f"查核發現 {len(issues)} 個問題，請代理補正",
                                  lambda s, r=report_file: setattr(s, "report_path", r))
             return

@@ -105,7 +105,7 @@ def test_full_p2_flow_until_done(tmp_path):
     # 代理寫好報告 → 唯讀查核（commit 存在、在功能分支、沒有空殼）→ 全部通過 → ④ 完成並關閉自動駕駛
     with open(st.report_path, "w", encoding="utf-8") as f:
         f.write(f"python -m pytest -q\n3 passed\n故意弄壞：改壞後 1 failed，改回後 3 passed，git status 乾淨\n"
-                f"COMMIT: {h} feature/export\n")
+                f"COMMIT: {h} feature/export\n【報告完畢】\n")
     sess.update(lambda s: setattr(s, "autopilot", True))
     w._drive(pw, stopped, "panel-5：報告已寫入", judge)
     st = sess.load()
@@ -137,7 +137,7 @@ def test_fake_commit_and_missing_mutation_are_rejected_then_pause(tmp_path):
         sess.update(lambda s, r=report: (setattr(s, "report_path", r), setattr(s, "evidence_requested_at", now_str()),
                                          setattr(s, "evidence_attempts", attempt)))
         with open(report, "w", encoding="utf-8") as f:
-            f.write("3 passed，commit deadbee")  # 假的 commit、沒有故意弄壞
+            f.write("3 passed\nCOMMIT: deadbee feature/x\n【報告完畢】")  # 假的 commit、沒有故意弄壞
         w._drive(pw, stopped, f"panel-{attempt}", judge)
         st = sess.load()
         assert st.acceptance[0]["status"] == "todo"
@@ -166,3 +166,46 @@ def test_no_loop_when_assistant_did_not_send(tmp_path):
     sess.update(lambda s: (setattr(s, "recent_tails", [drv2.agent_tail(same)] * 3), setattr(s, "last_panel_hash", "")))
     w._drive(pw, {"agent_state": "waiting_input", "summary": "停"}, same, judge)
     assert sess.load().suggested_action == "rollover"
+
+
+def test_waits_for_report_to_finish_and_followup_is_short(tmp_path):
+    path, h = _repo(tmp_path)
+    w = _worker(tmp_path)
+    pw = ProjectWindow(1, "kiro", "Kiro", "t", "proj", "", str(path), False, False)
+    judge = FakeJudge()
+    sess = w._session_for(pw)
+    report = os.path.join(sess.reports_dir, "r.md")
+    os.makedirs(sess.reports_dir, exist_ok=True)
+
+    def setup(st):
+        st.goal, st.acceptance_confirmed_at = "G", now_str()
+        st.acceptance = [{"text": "A", "test": "test_a", "status": "todo"}]
+        st.report_path, st.evidence_requested_at = report, now_str()
+    sess.update(setup)
+    stopped = {"agent_state": "waiting_input", "summary": "停"}
+    with open(report, "w", encoding="utf-8") as f:
+        f.write("故意弄壞後 FAILED (failures=5)\n")  # 還在寫，沒有結束標記
+    w._drive(pw, stopped, "p1", judge)
+    assert not any("嚴格的驗收查核者" in c for c in judge.calls)  # 第一次看到：先等，不查核
+    with open(report, "w", encoding="utf-8") as f:
+        f.write(f"故意弄壞後 FAILED (failures=5)，改回後 3 passed\nCOMMIT: {h} feature/export\n【報告完畢】\n")
+    w._drive(pw, stopped, "p2", judge)
+    assert any("嚴格的驗收查核者" in c for c in judge.calls) and sess.load().done_at
+
+
+def test_paused_session_makes_no_model_calls(tmp_path):
+    w = _worker(tmp_path)
+    pw = ProjectWindow(1, "kiro", "Kiro", "t", "proj", "", "", False, False)
+    sess = w._session_for(pw)
+    sess.update(lambda st: (setattr(st, "goal", "G"), setattr(st, "paused_reason", "連續 3 次要不到合格的證據")))
+    judge = FakeJudge()
+    for i in range(3):
+        w._drive(pw, {"agent_state": "waiting_input", "summary": "停"}, f"panel-{i}", judge)
+    assert judge.calls == []
+
+
+def test_followup_lists_only_gaps():
+    f = drv2.build_evidence_followup(["補 exit code"], "")
+    assert f.startswith(drv2.REPORT_MARK) and "1. 補 exit code" in f and drv2.REPORT_DONE in f
+    assert "故意弄壞" not in f and "逐條對照" not in f  # 不重複整份報告格式
+    assert len(f) < 200

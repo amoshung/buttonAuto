@@ -80,7 +80,8 @@ class SessionState:
     evidence_requested_at: str = ""
     evidence_attempts: int = 0
     report_path: str = ""
-    mutation_seen_at: str = ""  # 曾經在報告中看到「故意弄壞」的結果（之後的補正報告不必重做）
+    mutation_seen_at: str = ""
+    report_wait_hash: str = ""  # 報告還沒寫完時上一輪看到的內容指紋（連續兩輪不變才查核）  # 曾經在報告中看到「故意弄壞」的結果（之後的補正報告不必重做）
     last_issues: List[str] = field(default_factory=list)
     done_at: str = ""
     # 對話過長、原地打轉
