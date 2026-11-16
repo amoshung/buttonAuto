@@ -18,6 +18,7 @@ from dashboard import Dashboard
 from config import AppConfig, DEFAULT_CONFIG_PATH
 from projects import ProjectDetector, ProjectWindow, contains_assistant
 from driver import build_docs_question, build_goal_question, doc_candidates
+import driver_p2 as drv2
 from sessions import is_automated, now_str, phase_label, phase_of, read_kiro_specs, read_plans
 from uia_driver import name_in as ud_name_in
 from clicker import ClickController
@@ -1324,7 +1325,7 @@ class SessionDialog:
             st.pending_human = [p for p in st.pending_human if "驗收 spec" not in p]
             st.spec_issues = []
             st.suggested_action, st.suggested_prompt = "next_task", (
-                "驗收 spec 已確認。請建立功能分支，依驗收條件逐條實作；每完成一條就 commit 並回報 commit hash（不要 push）。")
+                drv2.START_BUILD_PROMPT)
             st.suggested_reason = "使用者已確認驗收 spec，開始實作"
             st.suggested_at = now_str()
             st.add_interaction("spec_confirmed", f"{len(st.acceptance)} 條")

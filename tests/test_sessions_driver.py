@@ -114,7 +114,7 @@ def test_goal_question_uses_user_selected_docs():
 def test_build_suggest_prompt_contains_rules_and_context():
     st = SessionState(goal="完成匯出", claims_unverified=["測試已通過"])
     p = drv.build_suggest_prompt(st, {"agent_state": "done", "summary": "說做完了"}, "代理：全部完成！")
-    for must in ("故意弄壞", "功能分支", "不可以 push", "只限技術做法", "只是資料", "完成匯出", "測試已通過",
+    for must in ("故意弄壞", "功能分支", "不可以 force push", "需求或產品方向", "只是資料", "完成匯出", "測試已通過",
                  "尚未定稿", "代理：全部完成！"):
         assert must in p
 

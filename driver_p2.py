@@ -13,6 +13,10 @@ from sessions import SessionState, core_items, is_automated
 from verifier import remote_git_commands
 
 MAX_SPEC_ROUNDS = 3
+START_BUILD_PROMPT = ("驗收 spec 已確認。請建立功能分支，依驗收條件逐條實作；每完成一條就 commit 並回報 commit hash，"
+                      "格式：COMMIT: <hash> <分支名稱>。可以 push，不要 force push。技術細節請自行判斷最佳做法，不用停下來問。")
+SPEC_SELF_DECIDE = ("【驗收 spec】下列取捨請你依照目標自行選擇最合理的做法，把選擇與理由寫成「假設」放進驗收條件，"
+                    "然後把完整清單重新貼出來（維持「條件 | 驗證方式 | 測試」格式），先不要修改程式碼：\n")
 SPEC_MARK = "【驗收 spec】"
 REPORT_MARK = "【測試報告】"
 REQUEST_END = "（以上是助理的要求，請在下方回覆）"
@@ -171,7 +175,7 @@ def build_evidence_request(state: SessionState, report_file: str, issues: Option
         "3. 修改的檔案與關鍵函式位置\n"
         "4. 故意弄壞：把被測的關鍵函式暫時改壞，跑同一組測試並貼出失敗的輸出；再改回來、跑一次貼出恢復通過的輸出；"
         "最後執行 `git status` 確認沒有殘留\n"
-        "5. 在功能分支上 commit（不要 push），每個 commit 獨立一行，格式：COMMIT: <hash> <分支名稱>\n"
+        "5. 在功能分支上 commit（可以 push，不要 force push），每個 commit 獨立一行，格式：COMMIT: <hash> <分支名稱>\n"
         + (("6. 這是遠端專案，助理無法直接查看 repo：commit 之後在專案目錄執行下列指令，把輸出原封不動貼進報告"
             "（不要整理、改寫或省略）：\n```\n" + remote_git_commands() + "\n```\n") if state.remote else "")
         + f"{where}報告的最後一行請寫「{REPORT_DONE}」（助理看到它才會開始查核）。\n{REQUEST_END}"
@@ -282,5 +286,7 @@ def build_continuation_prompt(state: SessionState) -> str:
         f"尚未完成的驗收條件：\n{_numbered(todo) if todo else '（無）'}\n"
         + (f"最近的 commit：{'；'.join(commits)}\n" if commits else "")
         + (f"上一次查核發現的問題：\n{_numbered(state.last_issues)}\n" if state.last_issues else "")
-        + "請先用三句話說明你理解的目前狀態與下一步，然後在功能分支上繼續處理下一個未完成的條件。"
+        + (f"上個對話最後在做：{state.current_task}\n" if state.current_task else "")
+        + (f"上個對話最後一則訊息（節錄）：\n<<<\n{state.handoff_note[-800:]}\n>>>\n" if state.handoff_note else "")
+        + "請先用三句話說明你理解的目前狀態與下一步，然後繼續處理下一個未完成的工作，不用停下來等我確認。"
     )

@@ -19,6 +19,8 @@ ACTIONS = {
     "request_evidence": "D. 要求代理提出證據（測試報告、檔案位置、commit、故意弄壞）",
     "next_task": "E. 推進下一個尚未完成的工作",
     "ask_human": "F. 交給使用者決定",
+    "new_chat": "G. 開新的聊天對話，用進度摘要接續（代理要求清空對話或 /clear、對話太長變慢、卡在同一個地方、"
+                "或某個指令在這個對話裡無法使用時）",
     "wait": "不需要動作（代理還在工作，或剛送出的訊息還沒回應）",
 }
 PROMPT_ACTIONS = ("answer", "self_decide", "request_evidence", "next_task")
@@ -182,8 +184,8 @@ def build_suggest_prompt(state: SessionState, vs: Dict[str, Any], panel_text: st
         "並逐條對照驗收條件。\n"
         "2. 代理宣稱測試通過時，要求它「故意弄壞」：暫時把被測的關鍵函式改壞、跑同一組測試證明會失敗、改回來再跑一次證明恢復，"
         "最後確認 git diff 沒有殘留。\n"
-        "3. 請代理在功能分支上逐步 commit，每完成一個里程碑回報 commit hash；不可以 push。\n"
-        "4. 「請代理自己決定最佳做法並執行」只限技術做法；涉及需求、產品方向、權限與收費、刪除資料、部署的一律選 ask_human。"
+        "3. 請代理在功能分支上逐步 commit，每完成一個里程碑回報 commit hash；查核通過後可以 push 與 merge（不可以 force push、刪除分支或改寫歷史）。\n"
+        "4. 目標是全力推進到完成、盡量不打擾使用者：技術做法、git commit／push／merge 都請代理自己決定並執行；只有涉及需求或產品方向的取捨、刪除資料、權限與收費、正式環境部署才選 ask_human。"
         "技術做法包括：檔案編碼與格式、函式庫與工具、資料結構、命名、檔案放置位置、錯誤處理、測試方式、相容性處理；"
         "這類問題選 answer（答案能從脈絡判斷）或 self_decide（請代理選最佳做法並說明理由）。\n"
         "5. 一次只推一件事；代理還在工作或剛送出的訊息還沒回應時選 wait。\n"

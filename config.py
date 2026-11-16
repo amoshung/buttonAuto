@@ -30,6 +30,9 @@ def _default_uia_button_names() -> List[str]:
     return ["Allow", "Always allow", "Submit", "允許", "一律允許", "提交"]
 
 
+_RETIRED_DENY_PATTERNS = (r"git\s+push\b", r"git\s+push\b.*(--force|-f\b)")
+
+
 def _default_deny_patterns() -> List[str]:
     # 命中任一規則（不分大小寫的正規表示式）時，AI 模式一律轉交人工決定
     return [
@@ -39,9 +42,17 @@ def _default_deny_patterns() -> List[str]:
         r"\bdel\s+/[sq]",
         r"\brmdir\s+/s",
         r"\bformat\s+[a-z]:",
-        r"git\s+push\b",  # Q12：所有 push 都交給使用者（含一般 push）
+        # git：commit／push／merge 可以自動；刪除或覆寫歷史的才交給使用者
+        r"git\s+push\b.*(--force|--force-with-lease|\s-f\b|--delete|\s-d\b|\s:\S)",
         r"git\s+reset\s+--hard",
         r"git\s+clean\s+-[a-z]*f",
+        r"git\s+rm\b",
+        r"git\s+branch\s+.*-[a-z]*[dD]\b",
+        r"git\s+tag\s+.*-d\b",
+        r"git\s+(checkout|restore)\s+.*--\s+\.",
+        r"git\s+stash\s+(drop|clear)\b",
+        r"git\s+filter-(branch|repo)\b",
+        r"git\s+rebase\b",
         r"\bdrop\s+(table|database|schema)\b",
         r"\btruncate\s+table\b",
         r"\bdelete\s+from\b",
@@ -158,6 +169,8 @@ class AppConfig:
             cfg.mode = "ai"
         if cfg.basic_mode not in ("image", "uia"):
             cfg.basic_mode = "uia"
+        # 改版拿掉的舊預設規則：一般 git push 改為可以自動（使用者 2026-11-16 決定）
+        cfg.deny_patterns = [p for p in cfg.deny_patterns if p not in _RETIRED_DENY_PATTERNS]
         # 舊設定檔沒有的新規則補上（使用者自己加的規則不動）
         for p in _default_deny_patterns():
             if p not in cfg.deny_patterns:

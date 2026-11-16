@@ -25,6 +25,15 @@ def now_str() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def recently(stamp: str, seconds: float) -> bool:
+    """stamp（now_str 格式）距今不到 seconds 秒。"""
+    try:
+        t = datetime.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return False
+    return (datetime.datetime.now() - t).total_seconds() < seconds
+
+
 def _safe(name: str) -> str:
     s = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", name).strip(" .")
     return s[:60] or "unnamed"
@@ -94,6 +103,8 @@ class SessionState:
     recent_tails: List[str] = field(default_factory=list)
     rollovers: int = 0
     rollover_pending: bool = False  # 已開新對話、接續摘要還沒送出
+    rollover_at: str = ""  # 最近一次由助理開新對話的時間；之後一段時間內對話標題改變都算同一個工作
+    handoff_note: str = ""  # 開新對話前，代理在舊對話的最後一則訊息（接續摘要用）
     # 查核用的 git repo（專案根目錄不是 repo、實作在子資料夾時指定）；空字串代表用專案路徑
     repo_path: str = ""
 

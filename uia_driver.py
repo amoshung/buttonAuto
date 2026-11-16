@@ -5,6 +5,7 @@ Chromium / Electron（Kiro、Antigravity、VS Code）預設不開放無障礙樹
 """
 import difflib
 import re
+import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
@@ -26,6 +27,17 @@ class ButtonInfo:
     name: str
     rect: Rect
     control: object
+    # Antigravity 的提問卡片：選項是單選鈕，要先選取再按 Submit；submit 不是 None 時代表這是那種虛擬按鈕
+    submit: Optional[object] = None
+
+
+def ask_option_name(raw: str) -> str:
+    """Antigravity 提問卡片的選項原文（去掉前面的序號與語音備忘按鈕的字）。
+
+    選項代表什麼意思（只允許一次、永久允許、拒絕…）交給主權 AI 看畫面判斷，這裡不做關鍵字對應。
+    """
+    t = re.sub(r"^\s*\d+\s+", "", raw or "").strip()
+    return re.sub(r"\s*Record voice memo$", "", t).strip()
 
 
 def _iuia():
@@ -133,6 +145,35 @@ class UiaWindow:
                     out.append(ButtonInfo(name, rect, c))
             except Exception:
                 continue
+        return out + self._ask_options(out)
+
+    def _ask_options(self, buttons: List[ButtonInfo]) -> List[ButtonInfo]:
+        """Antigravity 的提問／允許卡片：每個單選選項包成一個虛擬按鈕（按下＝選取該選項再按 Submit）。"""
+        submits = [b for b in buttons if name_in(b.name, ["Submit"])]
+        if not submits:
+            return []
+        out: List[ButtonInfo] = []
+        seen = set()
+        for c in _find_all(self.control, auto.PropertyId.ControlTypeProperty, auto.ControlType.RadioButtonControl):
+            try:
+                if not (c.AutomationId or "").startswith("ask-opt-"):
+                    continue
+                row = c.GetParentControl()
+                rect = _rect(row) if row is not None else _rect(c)
+                if not _visible(rect):
+                    continue
+                name = ask_option_name(c.Name or "")
+                if not name or name in seen:
+                    continue
+                # 同一張卡片的 Submit：在選項下方、最近的那個
+                below = [s for s in submits if s.rect[1] >= rect[1]]
+                if not below:
+                    continue
+                sub = min(below, key=lambda s: s.rect[1] - rect[1])
+                seen.add(name)
+                out.append(ButtonInfo(name, rect, c, submit=sub.control))
+            except Exception:
+                continue
         return out
 
     def chat_input(self) -> Optional[object]:
@@ -238,7 +279,7 @@ def pick_button(buttons: List[ButtonInfo], wanted: str, panel_rect: Optional[Rec
     return hits[0]
 
 
-APPROVAL_BUTTONS = ("Allow", "Always allow", "Deny", "Always deny", "Reject", "Run", "Accept", "Skip",
+APPROVAL_BUTTONS = ("Allow", "Always allow", "Always allow in this conversation", "Deny", "Always deny", "Reject", "Run", "Accept", "Skip",
                     "允許", "一律允許", "拒絕", "執行")
 
 
@@ -251,7 +292,9 @@ def _inside(rect: Rect, panel_rect: Optional[Rect]) -> bool:
 
 def approval_buttons(buttons: List[ButtonInfo], panel_rect: Optional[Rect] = None) -> List[str]:
     """聊天面板內「等你允許」類的按鈕名稱（依畫面由上到下）。"""
-    hits = [b for b in buttons if name_in(b.name, APPROVAL_BUTTONS) and _inside(b.rect, panel_rect)]
+    # 提問卡片的選項（submit 不是 None）一律列入：代理停在卡片上等你回答，選哪個由主權 AI 判斷
+    hits = [b for b in buttons if (b.submit is not None or name_in(b.name, APPROVAL_BUTTONS))
+            and _inside(b.rect, panel_rect)]
     hits.sort(key=lambda b: (b.rect[1], b.rect[0]))
     seen, out = set(), []
     for b in hits:
@@ -269,6 +312,23 @@ def agent_busy_reason(buttons: List[ButtonInfo], panel_rect: Optional[Rect] = No
     if any(name_in(b.name, ["Cancel", "Stop", "取消", "停止"]) and _inside(b.rect, panel_rect) for b in buttons):
         return "代理還在工作中"
     return ""
+
+
+def press(b: ButtonInfo) -> bool:
+    """按下按鈕；Antigravity 提問卡片的選項是先選取單選鈕、確認選到了，再按同一張卡片的 Submit。"""
+    if b.submit is None:
+        return invoke(b.control)
+    try:
+        sel = b.control.GetPattern(auto.PatternId.SelectionItemPattern)
+        if sel is None:
+            return False
+        sel.Select()
+        time.sleep(0.2)
+        if not sel.IsSelected:
+            return False
+    except Exception:
+        return False
+    return invoke(b.submit)
 
 
 def invoke(control) -> bool:

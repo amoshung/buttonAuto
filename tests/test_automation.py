@@ -327,9 +327,9 @@ def test_check_deny_negated_mentions_in_outgoing_prompts():
     assert check_deny(["請在功能分支 commit，不要 git push"], pats, allow_negated=True) is None
     assert check_deny(["禁止執行 rm -rf build"], pats, allow_negated=True) is None
     assert check_deny(["do not git push to origin"], pats, allow_negated=True) is None
-    assert check_deny(["請執行 git push origin main"], pats, allow_negated=True)
-    assert check_deny(["不要 push。接著 git push origin main"], pats, allow_negated=True)  # 後面那句是真的要 push
-    assert check_deny(["不要 git push"], pats)  # 代理要執行的指令不考慮否定
+    assert check_deny(["請執行 git push origin main"], pats, allow_negated=True) is None  # 一般 push 允許
+    assert check_deny(["不要 force push。接著 git push --force origin main"], pats, allow_negated=True)  # 後面那句是真的要 force push
+    assert check_deny(["不要 git rm a.py"], pats)  # 代理要執行的指令不考慮否定
 
 
 def test_extract_json_tolerates_paths_and_raw_newlines():
@@ -402,5 +402,46 @@ def test_asks_clear():
 def test_text_prompt_lists_panel_buttons_and_unknown_fallback():
     from automation import build_text_prompt, AGENT_STATES
     p = build_text_prompt("Kiro", "代理問：要繼續嗎？", ["Allow", "Deny"])
-    assert "Allow、Deny" in p and '"unknown"' in p and '"agent_state"' in p
+    assert "[1] Allow" in p and "[2] Deny" in p and '"unknown"' in p and '"agent_state"' in p
     assert "unknown" not in AGENT_STATES  # 回 unknown 就會改用截圖
+
+
+def test_roles_from_model_pick_allow_once_not_keywords():
+    from automation import approvals_from_roles, decide_approval, parse_control_roles
+    from config import AppConfig
+    controls = ["Yes, allow this time", "Yes, and always allow 'Get-ChildItem' in this conversation",
+                "Yes, and always allow 'Get-ChildItem'", "No (tell the agent what to do instead)", "Skip",
+                "Add context"]
+    vs = {"controls": [{"id": 1, "role": "allow_once"}, {"id": 2, "role": "allow_always"},
+                       {"id": 3, "role": "allow_always"}, {"id": 4, "role": "deny"}, {"id": 5, "role": "skip"},
+                       {"id": 6, "role": "other"}, {"id": 99, "role": "allow_once"}]}
+    roles = parse_control_roles(vs, controls)
+    assert len(roles) == 6
+    approvals = approvals_from_roles(roles, controls, ["Skip"])
+    assert approvals == controls[:5]
+    answers = {"allow": {"noul": 1.0}, "risk": {"noul": 0.0}}
+    plan, _ = decide_approval(answers, None, approvals, AppConfig(), roles)
+    assert plan.kind == "click" and plan.button == "Yes, allow this time"
+
+
+def test_model_mislabel_of_persistent_option_is_still_refused():
+    from automation import decide_approval
+    from config import AppConfig
+    roles = {"Yes, and always allow 'rm'": "allow_once", "No": "deny"}
+    plan, _ = decide_approval({"allow": {"noul": 1.0}, "risk": {"noul": 0.0}}, None, list(roles), AppConfig(), roles)
+    assert plan.kind == "ask_human"
+
+
+def test_question_card_answers_are_not_approvals():
+    from automation import approvals_from_roles
+    controls = ["Use PostgreSQL", "Use SQLite", "Skip"]
+    roles = {"Use PostgreSQL": "answer", "Use SQLite": "answer", "Skip": "skip"}
+    assert approvals_from_roles(roles, controls, controls) == []
+    assert approvals_from_roles({}, controls, ["Skip"]) == ["Skip"]  # 模型沒標時才退回名稱比對
+
+
+def test_ask_option_name_keeps_original_text():
+    import uia_driver as ud
+    assert ud.ask_option_name("1 Yes, allow this time") == "Yes, allow this time"
+    assert ud.ask_option_name("4 No (tell the agent what to do instead) Record voice memo") == \
+        "No (tell the agent what to do instead)"

@@ -243,7 +243,7 @@ def test_after_done_new_work_autopilot_starts_new_goal(tmp_path):
     w._drive(pw, stopped, "新的對話：U2 第一段完成，要繼續嗎？", judge)
     st = sess.load()
     assert st.goal == "完成 U2 第二段 API" and st.goal_source == "inferred" and not st.done_at
-    assert st.current_task.startswith("實作") and any("確認新目標" in p for p in st.pending_human)
+    assert st.current_task.startswith("實作") and not st.pending_human  # 自動駕駛不再停下來等你確認
     assert os.listdir(os.path.join(sess.dir, "archive"))  # 舊進度有封存
 
 
@@ -279,3 +279,17 @@ def test_notify_only_new_pending_items_rate_limited(tmp_path, monkeypatch):
     w._notify_at[pw.key] -= 61
     w._notify_pending(pw)
     assert sent[-1] == "新的第二項"
+
+
+def test_model_can_choose_new_chat_and_new_chat_rebinds(tmp_path):
+    import driver as drv
+    sug = drv.parse_suggestion('{"action":"new_chat","reason":"代理要求 /clear 但這裡不能用","prompt":""}')
+    assert sug["action"] == "new_chat"
+    w = _worker(tmp_path)
+    pw = ProjectWindow(3, "antigravity", "Antigravity", "t", "proj", "", str(tmp_path), False, False)
+    sess = w._session_for(pw)
+    sess.update(lambda st: (setattr(st, "goal", "G"), setattr(st, "chat_title", "舊對話")))
+    assert w._other_chat(pw, "別的對話") is True  # 平常：別的對話不碰
+    sess.update(lambda st: setattr(st, "rollover_at", now_str()))
+    assert w._other_chat(pw, "代理取的新標題") is False  # 助理剛開的新對話：跟著重新綁定
+    assert sess.load().chat_title == "代理取的新標題"

@@ -100,7 +100,7 @@ def test_evidence_request_contains_all_required_parts():
                                             {"text": "B", "test": "pytest b", "status": "todo"}])
     p = drv2.build_evidence_request(st, r"D:\s\reports\r.md", ["commit 不存在"])
     assert p.startswith(drv2.REPORT_MARK)
-    for must in ("- B（測試：pytest b）", "完整輸出", "故意弄壞", "git status", "功能分支", "不要 push", "r.md",
+    for must in ("- B（測試：pytest b）", "完整輸出", "故意弄壞", "git status", "功能分支", "不要 force push", "r.md",
                  "1. commit 不存在"):
         assert must in p
     assert "- A" not in p  # 已查核通過的不再要求
@@ -163,15 +163,22 @@ def test_phase_of_and_render():
         assert must in md
 
 
-def test_config_blocks_plain_git_push_and_migrates(tmp_path):
+def test_git_commit_push_merge_allowed_only_destructive_git_blocked(tmp_path):
     import json
     from automation import check_deny
     cfg = AppConfig()
-    assert check_deny(["git push origin feature/x"], cfg.deny_patterns)
+    for ok in ("git push origin feature/x", "git push -u origin feat/a", "git merge feature/x", "git commit -m x",
+               "git checkout -b feat/y", "git pull --rebase=false"):
+        assert check_deny([ok], cfg.deny_patterns) is None, ok
+    for bad in ("git push --force origin main", "git push -f origin main", "git push origin --delete feat/x",
+                "git push origin :feat/x", "git rm a.py", "git branch -D feat/x", "git reset --hard HEAD~1",
+                "git clean -fd", "git rebase -i HEAD~3", "git stash drop", "git checkout -- ."):
+        assert check_deny([bad], cfg.deny_patterns), bad
     old = tmp_path / "config.json"
-    old.write_text(json.dumps({"deny_patterns": [r"\brm\s+-rf"]}), encoding="utf-8")
+    old.write_text(json.dumps({"deny_patterns": [r"\brm\s+-rf", r"git\s+push\b"]}), encoding="utf-8")
     loaded = AppConfig.load(str(old))
-    assert r"git\s+push\b" in loaded.deny_patterns and r"\brm\s+-rf" in loaded.deny_patterns
+    assert r"git\s+push\b" not in loaded.deny_patterns and r"\brm\s+-rf" in loaded.deny_patterns
+    assert check_deny(["git push origin main"], loaded.deny_patterns) is None
 
 
 def test_parse_spec_lines_and_latest_segment():
