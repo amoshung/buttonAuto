@@ -130,14 +130,18 @@ _TEST_OUTPUT = re.compile(r"\b\d+\s+(passed|failed|tests?|個測試)|test result
 _MUTATION = re.compile(r"故意弄壞|mutation|改壞|破壞測試", re.I)
 
 
-def deterministic_issues(facts: Dict[str, Any], report_text: str, remote: bool) -> List[str]:
+def has_mutation_evidence(report_text: str) -> bool:
+    return bool(_MUTATION.search(report_text or ""))
+
+
+def deterministic_issues(facts: Dict[str, Any], report_text: str, remote: bool, mutation_seen: bool = False) -> List[str]:
     """不需要 AI 就能確定的問題。有任何一項，該次查核就不能算通過。"""
     issues: List[str] = []
     if not report_text.strip():
         return ["沒有找到測試報告"]
     if not _TEST_OUTPUT.search(report_text):
         issues.append("報告裡沒有看到測試輸出（通過／失敗數量），請貼出實際執行的完整輸出")
-    if not _MUTATION.search(report_text):
+    if not mutation_seen and not _MUTATION.search(report_text):
         issues.append("報告缺少「故意弄壞」的結果：請把被測的關鍵函式暫時改壞、證明測試會失敗，再改回並證明恢復通過")
     if remote:
         return issues

@@ -236,3 +236,10 @@ def test_evidence_request_lists_only_core_items_and_latest_reply():
     assert drv2.latest_reply("沒有要求的對話") == "沒有要求的對話"
     verify = drv2.build_verify_prompt(st, "r", "facts", [])
     assert "0. 核心 A" in verify and "環境 B" not in verify
+
+
+def test_mutation_evidence_remembered():
+    assert verifier.has_mutation_evidence("故意弄壞後 2 failed")
+    later = verifier.deterministic_issues({}, "補正：4 passed", remote=True, mutation_seen=True)
+    assert not any("故意弄壞" in x for x in later)
+    assert any("故意弄壞" in x for x in verifier.deterministic_issues({}, "4 passed", remote=True))

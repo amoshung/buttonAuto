@@ -1253,7 +1253,9 @@ class AutomationWorker(threading.Thread):
             report = drv2.latest_reply(panel_text)
         repo = self._repo_path(w, snap) if local else ""
         facts = verifier.gather_facts(repo, report) if repo else {"is_repo": False}
-        det = verifier.deterministic_issues(facts, report, remote=not local)
+        mutation_now = verifier.has_mutation_evidence(report)
+        det = verifier.deterministic_issues(facts, report, remote=not local,
+                                            mutation_seen=bool(snap.mutation_seen_at) or mutation_now)
         results, issues = drv2.parse_verify(
             judge.chat(drv2.build_verify_prompt(snap, report, verifier.facts_summary(facts), det),
                        max_tokens=4000, temperature=0), len(snap.acceptance), det)
@@ -1276,6 +1278,8 @@ class AutomationWorker(threading.Thread):
                                        "desc": c.get("subject", "")[:120], "check": check})
             st.last_issues = issues
             st.evidence_requested_at = ""
+            if mutation_now and not st.mutation_seen_at:
+                st.mutation_seen_at = now_str()
             if st.acceptance and all(a.get("status") == "verified" for a in core_items(st)):
                 st.done_at = now_str()
                 st.autopilot = False
