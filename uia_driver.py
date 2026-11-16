@@ -13,6 +13,10 @@ import uiautomation as auto
 TREE_SCOPE_DESCENDANTS = 4
 _INPUT_CLASS_HINTS = ("prosemirror", "chat-input", "contenteditable", "interactive-input", "monaco-inputbox")
 _INPUT_CLASS_EXCLUDE = ("native-edit-context", "xterm-helper-textarea", "inputarea")
+# 已知的聊天輸入框名稱（Antigravity 為「Message input」）
+_INPUT_NAMES = ("message input", "chat input", "ask anything")
+# 這些名稱的輸入框是 IDE 內建的搜尋／篩選框，不是聊天框
+_INPUT_NAME_EXCLUDE = ("filter", "search", "find", "replace", "篩選", "搜尋")
 
 Rect = Tuple[int, int, int, int]
 
@@ -95,9 +99,10 @@ class UiaWindow:
         for c in _find_all(self.control, auto.PropertyId.IsKeyboardFocusableProperty, True):
             try:
                 cls = (c.ClassName or "").lower()
-                if any(x in cls for x in _INPUT_CLASS_EXCLUDE):
+                name = (c.Name or "").strip().lower()
+                if any(x in cls for x in _INPUT_CLASS_EXCLUDE) or any(name.startswith(x) for x in _INPUT_NAME_EXCLUDE):
                     continue
-                is_hint = any(h in cls for h in _INPUT_CLASS_HINTS)
+                is_hint = any(h in cls for h in _INPUT_CLASS_HINTS) or any(name.startswith(x) for x in _INPUT_NAMES)
                 is_edit = c.ControlTypeName == "EditControl"
                 if not (is_hint or is_edit):
                     continue
@@ -218,13 +223,14 @@ def invoke(control) -> bool:
 
 
 _SEND_NAMES = ("send", "submit", "送出", "傳送", "send message")
+_SEND_CLASS_HINTS = ("send-button", "send_button", "sendbutton")
 _NOT_SEND = ("add context", "attach", "model", "default", "agent", "context", "image", "mic", "voice")
 
 
 def find_send_button(inp) -> Optional[ButtonInfo]:
     """聊天輸入框旁的送出按鈕。Kiro 的送出鈕只有圖示、沒有名稱，位在輸入框外框右上角。"""
     wrapper = inp
-    for _ in range(4):
+    for _ in range(6):
         try:
             wrapper = wrapper.GetParentControl()
         except Exception:
@@ -232,7 +238,7 @@ def find_send_button(inp) -> Optional[ButtonInfo]:
         if wrapper is None:
             return None
         cls = (wrapper.ClassName or "").lower()
-        if "chat-input-wrapper" in cls or "input-wrapper" in cls or "session-view-input" in cls:
+        if any(x in cls for x in ("chat-input-wrapper", "input-wrapper", "session-view-input", "composer-card")):
             break
     in_rect = _rect(inp)
     cands = []
@@ -246,7 +252,8 @@ def find_send_button(inp) -> Optional[ButtonInfo]:
             continue
         if not _visible(r) or any(x in n for x in _NOT_SEND):
             continue
-        if n in _SEND_NAMES or (n == "" and r[0] >= in_rect[2] - 10):
+        cls = (c.ClassName or "").lower()
+        if n in _SEND_NAMES or any(x in cls for x in _SEND_CLASS_HINTS) or (n == "" and r[0] >= in_rect[2] - 10):
             cands.append(ButtonInfo(c.Name or "", r, c))
     if not cands:
         return None
@@ -286,6 +293,9 @@ def set_focus(control) -> bool:
         return False
 
 
+_PLACEHOLDERS = ("ask a question or describe a task", "ask anything, @ to mention")
+
+
 def input_text(control) -> str:
     """輸入框目前的文字（空的輸入框回傳空字串，不回傳提示文字）。"""
     try:
@@ -294,7 +304,8 @@ def input_text(control) -> str:
                 return ""
         vp = control.GetPattern(auto.PatternId.ValuePattern)
         if vp:
-            return vp.Value or ""
+            v = vp.Value or ""
+            return "" if v.strip().lower().startswith(_PLACEHOLDERS) else v
         tp = control.GetPattern(auto.PatternId.TextPattern)
         if tp:
             return tp.DocumentRange.GetText(-1) or ""
