@@ -5,7 +5,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
 import cv2
 from PIL import Image, ImageTk
@@ -241,8 +241,12 @@ class FloatingOverlayApp:
 
     # ------------------------------------------------------------------ 分頁：工作階段（勾選才會被操作）
     def _build_sessions_tab(self, parent: tk.Frame) -> None:
+        self.hum_box = tk.LabelFrame(parent, text=" 🙋 需要你決定 ", bg=BG, fg="#FBBF24", font=FONT_B, padx=6, pady=4)
+        self.human_frame = tk.Frame(self.hum_box, bg=BG2)
+        self.human_frame.pack(fill="both", expand=True)
         head = tk.Frame(parent, bg=BG)
         head.pack(fill="x")
+        self._sessions_head = head
         _label(head, "每個視窗選一個模式：關閉／只建議／自動駕駛", fg=FG_DIM, font=FONT_S).pack(side="left")
         _button(head, "↻", self._refresh_sessions).pack(side="right")
         self.sessions_frame = tk.Frame(parent, bg=BG2, pady=2)
@@ -254,10 +258,6 @@ class FloatingOverlayApp:
         self._dialogs: Dict[str, "SessionDialog"] = {}
         self._mode_boxes: Dict[str, ttk.Combobox] = {}
 
-        hum = tk.LabelFrame(parent, text=" 🙋 需要你決定（輪巡時跳過） ", bg=BG, fg="#FBBF24", font=FONT_B, padx=6, pady=4)
-        hum.pack(fill="both", expand=True)
-        self.human_frame = tk.Frame(hum, bg=BG2)
-        self.human_frame.pack(fill="both", expand=True)
         self._refresh_sessions()
 
     def _refresh_sessions(self) -> None:
@@ -496,8 +496,9 @@ class FloatingOverlayApp:
             w.destroy()
         self.nb.tab(self.tab_sessions, text=f"工作階段 🙋{len(items)}" if items else "工作階段")
         if not items:
-            tk.Label(self.human_frame, text="目前沒有", bg=BG2, fg=FG_DIM, font=FONT_S, pady=4).pack(fill="x")
+            self.hum_box.pack_forget()
             return
+        self.hum_box.pack(fill="x", pady=(0, 6), before=self._sessions_head)
         for it in items:
             box = tk.Frame(self.human_frame, bg=BG2, pady=2)
             box.pack(fill="x", padx=2, pady=2)
@@ -1059,7 +1060,9 @@ class SessionDialog:
 
         self.docs_box = tk.LabelFrame(body, text=" 📄 正在進行的計畫（可多選；由你勾選或請代理判斷） ", bg=BG,
                                       fg="#38BDF8", font=FONT_B, padx=6, pady=4)
-        self.docs_box.pack(fill="x", pady=(2, 4))
+        self._docs_open = False
+        self.docs_toggle = _button(body, "▸ 進階：正在進行的計畫文件", self._toggle_docs)
+        self.docs_toggle.pack(anchor="w", pady=(2, 2))
         lb_row = tk.Frame(self.docs_box, bg=BG)
         lb_row.pack(fill="x")
         self.docs_list = tk.Listbox(lb_row, selectmode="multiple", height=4, bg=BG2, fg="#FFFFFF",
@@ -1114,7 +1117,7 @@ class SessionDialog:
         self._fill_p2(st)
         if st.agent_goal_proposal:
             self.proposal_lbl.configure(text=st.agent_goal_proposal)
-            self.proposal_box.pack(fill="x", pady=(0, 4), before=self.docs_box)
+            self.proposal_box.pack(fill="x", pady=(0, 4), before=self.docs_toggle)
             self.adopt_btn.configure(state="normal")
         else:
             self.proposal_box.pack_forget()
@@ -1127,7 +1130,7 @@ class SessionDialog:
                 deny = ud_name_in(name, ["Deny", "Always deny", "Reject", "Skip", "拒絕"])
                 _button(self.approval_btns, f"代按「{name}」", lambda n=name: self.click(n),
                         bg="#B91C1C" if deny else "#10B981").pack(side="left", padx=(0, 6))
-            self.approval_box.pack(fill="x", pady=(0, 4), after=self.docs_box)
+            self.approval_box.pack(fill="x", pady=(0, 4), before=self.docs_toggle)
         else:
             self.approval_box.pack_forget()
         local = bool(self.pw.path) and not self.pw.remote
@@ -1229,6 +1232,8 @@ class SessionDialog:
             self.docs_info.configure(text=f"已確認（{who}）：" + "、".join(st.active_docs))
         else:
             self.docs_info.configure(text="尚未確認。選取正在進行的項目後按「儲存勾選」，或按「讓代理判斷」。")
+        if agent and set(st.active_docs) != agent and not self._docs_open:
+            self._toggle_docs(True)
         if agent and set(st.active_docs) != agent:
             self.docs_info.configure(text=self.docs_info.cget("text") + "\n🤖 = 代理認為正在進行，可按「套用代理的判斷」")
             self.adopt_docs_btn.configure(state="normal")
@@ -1292,6 +1297,15 @@ class SessionDialog:
             self.goal_text.delete("1.0", "end")
             self.goal_text.insert("1.0", st.agent_goal_proposal)
             self.result_lbl.configure(text="已帶入代理說明的目標，可修改後按「儲存目標」。", fg=FG_DIM)
+
+    def _toggle_docs(self, force: Optional[bool] = None) -> None:
+        self._docs_open = (not self._docs_open) if force is None else force
+        if self._docs_open:
+            self.docs_box.pack(fill="x", pady=(0, 4), after=self.docs_toggle)
+            self.docs_toggle.configure(text="▾ 進階：正在進行的計畫文件")
+        else:
+            self.docs_box.pack_forget()
+            self.docs_toggle.configure(text="▸ 進階：正在進行的計畫文件")
 
     def click(self, name: str) -> None:
         self.result_lbl.configure(text=f"代按「{name}」中…（UIA，不動滑鼠）", fg=FG_DIM)

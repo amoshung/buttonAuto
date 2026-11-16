@@ -467,6 +467,14 @@ def build_daily_summary(store: SessionStore, date: str) -> str:
             f"- 今天的紀錄：觀察 {kinds.get('observe', 0)} 次、建議 {kinds.get('suggest', 0)} 次、"
             f"實際操作 {kinds.get('action', 0)} 次、交給你 {kinds.get('ask_human', 0)} 次",
         ]
+        reasons: Dict[str, int] = {}
+        for h in hist:
+            if h.get("kind") == "ask_human":
+                r = re.sub(r"[\d.]+", "#", str(h.get("text", "")))[:40]
+                reasons[r] = reasons.get(r, 0) + 1
+        if reasons:
+            top = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
+            out.append("- 交給你的原因（前 3 名，可據此調整門檻）：" + "；".join(f"{r}（{n} 次）" for r, n in top))
         today_commits = [c for c in st.commits if c.get("time", "").startswith(date)]
         if today_commits:
             out.append("- 今天的里程碑 commit：" + "、".join(f"{c.get('hash', '')} {c.get('desc', '')}" for c in today_commits))
