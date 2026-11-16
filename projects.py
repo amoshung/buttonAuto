@@ -202,6 +202,14 @@ class ProjectDetector:
         ws = self._workspaces(spec)
         project, remote = parse_title(spec.key, w.title)
         path, ambiguous = resolve_path(project, remote, ws)
+        if project and not path:
+            # 剛開的新專案：IDE 才剛寫入 workspaceStorage，快取還是舊的。立刻重讀（最多每 3 秒一次），
+            # 否則前 30 秒會用專案名稱當識別，之後換成完整路徑，使用者在這段時間設定的模式會遺失
+            hit = self._cache.get(spec.key)
+            if hit and time.monotonic() - hit[0] > 3.0:
+                self._cache.pop(spec.key, None)
+                ws = self._workspaces(spec)
+                path, ambiguous = resolve_path(project, remote, ws)
         if spec.key == "kiro" and project and not path and len(w.title.split(" - ")) == 2:
             # 「Getting started - Kiro」這類只有兩段、又對不到任何資料夾的標題，視為沒開專案
             project = ""

@@ -96,3 +96,21 @@ def test_session_modes_and_self_detection(tmp_path):
     assert contains_assistant(ASSISTANT_DIR) and contains_assistant(os.path.join(ASSISTANT_DIR, "sub"))
     assert not contains_assistant(os.path.dirname(ASSISTANT_DIR))  # 上層資料夾是別的對話
     assert not contains_assistant(ASSISTANT_DIR, remote="host")
+
+
+def test_new_project_refreshes_workspace_cache(tmp_path, monkeypatch):
+    import projects
+    calls = []
+    entries = [[], [WorkspaceEntry("newproj", r"D:\x\newproj", "", 1.0)]]
+
+    def fake_load(storage_dir, appdata=None):
+        calls.append(storage_dir)
+        return entries[min(len(calls) - 1, 1)]
+    monkeypatch.setattr(projects, "load_workspaces", fake_load)
+    det = ProjectDetector()
+    win = wu.WindowInfo(1, "a.py - newproj - Kiro", "Kiro.exe", False)
+    first = det.describe(win)  # 快取剛建立：還找不到路徑
+    assert first.path == ""
+    det._cache["kiro"] = (det._cache["kiro"][0] - 10, det._cache["kiro"][1])  # 讓快取變舊
+    second = det.describe(win)
+    assert second.path == r"D:\x\newproj" and len(calls) == 2
