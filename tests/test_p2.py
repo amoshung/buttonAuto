@@ -243,3 +243,35 @@ def test_mutation_evidence_remembered():
     later = verifier.deterministic_issues({}, "補正：4 passed", remote=True, mutation_seen=True)
     assert not any("故意弄壞" in x for x in later)
     assert any("故意弄壞" in x for x in verifier.deterministic_issues({}, "4 passed", remote=True))
+
+
+def _remote_report(full="a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", short="a1b2c3d", show_subject="add word_count",
+                   dirty="", summary=True):
+    stat = " wc.py | 12 ++++++++++++\n test_wc.py | 20 ++++++++++++++++++++\n"
+    if summary:
+        stat += " 2 files changed, 32 insertions(+)\n"
+    return ("6 passed\n故意弄壞：失敗 1 個\nCOMMIT: a1b2c3d feature/wc\n```\n"
+            "$ echo GIT-BEGIN\nGIT-BEGIN\nfeature/wc\n" + dirty + "GIT-STATUS-END\n"
+            f"GITLOG {full} {short} add word_count\n"
+            "GITLOG 0000000000000000000000000000000000000abc 0000000 init\n"
+            f"GITSHOW {full} {show_subject}\n" + stat + "GIT-END\n```\n")
+
+
+def test_remote_git_output_consistent_passes():
+    from verifier import deterministic_issues, parse_remote_git
+    rep = _remote_report()
+    f = parse_remote_git(rep)
+    assert f["branch"] == "feature/wc" and f["dirty"] == []
+    assert f["commits"][0]["exists"] and f["commits"][0]["files"] == ["wc.py", "test_wc.py"]
+    assert deterministic_issues(f, rep, remote=True) == []
+
+
+def test_remote_git_output_inconsistencies_are_issues():
+    from verifier import deterministic_issues, parse_remote_git
+    bad = _remote_report(short="ffffff1", show_subject="something else", dirty=" M wc.py\n", summary=False)
+    issues = deterministic_issues(parse_remote_git(bad), bad, remote=True)
+    text = "\n".join(issues)
+    assert "不是" in text and "標題不一致" in text and "files changed" in text and "未 commit" in text
+    missing = deterministic_issues(parse_remote_git("6 passed\n故意弄壞\nCOMMIT: a1b2c3d feature/wc"),
+                                   "6 passed\n故意弄壞", remote=True)
+    assert any("GIT-BEGIN" in i for i in missing)

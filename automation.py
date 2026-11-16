@@ -1465,7 +1465,12 @@ class AutomationWorker(threading.Thread):
                 self._session(w, "⏳ 等代理寫完測試報告（看到「【報告完畢】」或內容不再變動才查核）")
                 return
         repo = self._repo_path(w, snap) if local else ""
-        facts = verifier.gather_facts(repo, report) if repo else {"is_repo": False}
+        if repo:
+            facts = verifier.gather_facts(repo, report)
+        elif w.remote:
+            facts = verifier.parse_remote_git(report)  # 遠端：檢查代理貼出的 git 原始輸出（D12）
+        else:
+            facts = {"is_repo": False}
         mutation_now = verifier.has_mutation_evidence(report)
         det = verifier.deterministic_issues(facts, report, remote=not local,
                                             mutation_seen=bool(snap.mutation_seen_at) or mutation_now)

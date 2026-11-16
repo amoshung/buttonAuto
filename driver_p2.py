@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ai_client import extract_json
 from sessions import SessionState, core_items, is_automated
+from verifier import remote_git_commands
 
 MAX_SPEC_ROUNDS = 3
 SPEC_MARK = "【驗收 spec】"
@@ -171,7 +172,9 @@ def build_evidence_request(state: SessionState, report_file: str, issues: Option
         "4. 故意弄壞：把被測的關鍵函式暫時改壞，跑同一組測試並貼出失敗的輸出；再改回來、跑一次貼出恢復通過的輸出；"
         "最後執行 `git status` 確認沒有殘留\n"
         "5. 在功能分支上 commit（不要 push），每個 commit 獨立一行，格式：COMMIT: <hash> <分支名稱>\n"
-        f"{where}報告的最後一行請寫「{REPORT_DONE}」（助理看到它才會開始查核）。\n{REQUEST_END}"
+        + (("6. 這是遠端專案，助理無法直接查看 repo：commit 之後在專案目錄執行下列指令，把輸出原封不動貼進報告"
+            "（不要整理、改寫或省略）：\n```\n" + remote_git_commands() + "\n```\n") if state.remote else "")
+        + f"{where}報告的最後一行請寫「{REPORT_DONE}」（助理看到它才會開始查核）。\n{REQUEST_END}"
     )
 
 

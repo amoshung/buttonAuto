@@ -5,7 +5,7 @@
 import os
 import re
 import subprocess
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # 只允許讀取類的 git 子指令
 _READONLY_GIT = {"rev-parse", "status", "cat-file", "show", "log", "diff", "branch"}
@@ -144,18 +144,21 @@ def deterministic_issues(facts: Dict[str, Any], report_text: str, remote: bool, 
     if not mutation_seen and not _MUTATION.search(report_text):
         issues.append("報告缺少「故意弄壞」的結果：請把被測的關鍵函式暫時改壞、證明測試會失敗，再改回並證明恢復通過")
     if remote:
-        return issues
-    if not facts.get("is_repo"):
+        issues += facts.get("remote_issues") or []
+        if not facts.get("is_repo"):
+            return issues
+    elif not facts.get("is_repo"):
         issues.append("專案路徑不是 git repo，無法查核 commit")
         return issues
     commits = facts.get("commits") or []
     existing = [c for c in commits if c.get("exists")]
-    if existing and all(set(c.get("branches") or []) <= _MAIN_BRANCHES for c in existing):
+    if existing and all(c.get("branches") for c in existing) and \
+            all(set(c.get("branches") or []) <= _MAIN_BRANCHES for c in existing):
         issues.append("報告的 commit 都只在主分支上，請改在功能分支上實作與 commit")
     if not commits:
         issues.append("報告沒有提供 commit hash（請用「COMMIT: <hash> <分支>」的格式逐行列出）")
     for c in commits:
-        if not c.get("exists"):
+        if not c.get("exists") and not remote:  # 遠端的「不存在」已由 parse_remote_git 說明
             issues.append(f"報告提到的 commit `{c['hash']}` 在 repo 裡找不到")
     if facts.get("dirty"):
         issues.append("工作目錄還有未 commit 的變更（例如「故意弄壞」後沒改回來）：" + "、".join(facts["dirty"][:5]))
@@ -164,10 +167,110 @@ def deterministic_issues(facts: Dict[str, Any], report_text: str, remote: bool, 
     return issues
 
 
+# ---- 遠端專案（D12）：助理讀不到遠端 repo，改要代理貼出固定格式的 git 原始輸出，再檢查彼此是否一致
+REMOTE_GIT_BEGIN, REMOTE_STATUS_END, REMOTE_GIT_END = "GIT-BEGIN", "GIT-STATUS-END", "GIT-END"
+
+
+def remote_git_commands(hashes_hint: str = "<每個 COMMIT 的 hash>") -> str:
+    return (f"echo {REMOTE_GIT_BEGIN}\n"
+            "git rev-parse --abbrev-ref HEAD\n"
+            "git status --porcelain\n"
+            f"echo {REMOTE_STATUS_END}\n"
+            "git log -n 10 --format=\"GITLOG %H %h %s\"\n"
+            f"git show --stat --format=\"GITSHOW %H %s\" {hashes_hint}\n"
+            f"echo {REMOTE_GIT_END}")
+
+
+_GITLOG = re.compile(r"^\s*GITLOG\s+([0-9a-f]{40})\s+([0-9a-f]{4,40})\s*(.*)$")
+_GITSHOW = re.compile(r"^\s*GITSHOW\s+([0-9a-f]{40})\s*(.*)$")
+_STAT_FILE = re.compile(r"^\s*(\S.*?)\s+\|\s+(\d+|Bin)")
+_STAT_SUMMARY = re.compile(r"\d+\s+files?\s+changed")
+_COMMIT_BRANCH = re.compile(r"^\s*[-*>]?\s*COMMIT\s*[:：]\s*`?([0-9a-f]{7,40})`?\s+`?([^\s`]+)", re.I | re.M)
+
+
+def parse_remote_git(report: str) -> Dict[str, Any]:
+    """從報告裡的 GIT-BEGIN … GIT-END 區塊整理出和 gather_facts 相同形狀的事實，外加 remote_issues。"""
+    text = report or ""
+    facts: Dict[str, Any] = {"is_repo": False, "remote": True, "branch": "", "dirty": [], "commits": [], "recent": "",
+                             "stubs": [], "remote_issues": []}
+    issues: List[str] = facts["remote_issues"]
+    b, e = text.rfind(REMOTE_GIT_BEGIN), text.rfind(REMOTE_GIT_END)
+    # 指令本身也含有這些字（echo GIT-BEGIN）：取最後一個不是 echo 指令的位置
+    lines = text[b:].splitlines() if b >= 0 else []
+    if b < 0 or e < b:
+        issues.append("遠端專案無法直接查核：請執行下列指令並把原始輸出原封不動貼進報告（不要整理或改寫）：\n"
+                      + remote_git_commands())
+        return facts
+    # 略過終端機回顯的指令行與提示字元，只留下輸出
+    block = [ln.rstrip() for ln in lines[1:]
+             if not ln.strip().startswith(("echo ", "git ", "$ ", "PS ", "> ", "```"))]
+    try:
+        end = next(i for i, ln in enumerate(block) if ln.strip() == REMOTE_GIT_END)
+        block = block[:end]
+    except StopIteration:
+        pass
+    facts["is_repo"] = True
+    head = [ln for ln in block if ln.strip()]
+    facts["branch"] = head[0].strip() if head else ""
+    try:
+        st_end = next(i for i, ln in enumerate(block) if ln.strip() == REMOTE_STATUS_END)
+        facts["dirty"] = [ln.strip() for ln in block[:st_end] if ln.strip()][1:31]
+    except StopIteration:
+        issues.append(f"git 原始輸出缺少「{REMOTE_STATUS_END}」那一行，無法確認工作目錄是否乾淨")
+    log: Dict[str, str] = {}
+    recent: List[str] = []
+    shows: Dict[str, Dict[str, Any]] = {}
+    cur: Optional[Dict[str, Any]] = None
+    for ln in block:
+        m = _GITLOG.match(ln)
+        if m:
+            full, short, subj = m.group(1), m.group(2), m.group(3).strip()
+            if not full.startswith(short):
+                issues.append(f"git log 輸出不一致：短 hash `{short}` 不是 `{full}` 的開頭（請貼原始輸出，不要手打）")
+            log[full] = subj
+            recent.append(f"{short} {subj}")
+            cur = None
+            continue
+        m = _GITSHOW.match(ln)
+        if m:
+            cur = {"subject": m.group(2).strip(), "files": [], "summary": False}
+            shows[m.group(1)] = cur
+            continue
+        if cur is not None:
+            fm = _STAT_FILE.match(ln)
+            if fm:
+                cur["files"].append(fm.group(1).strip())
+            elif _STAT_SUMMARY.search(ln):
+                cur["summary"] = True
+    facts["recent"] = "\n".join(recent)
+    if not log:
+        issues.append("沒有看到「GITLOG <完整 hash> <短 hash> <標題>」格式的 git log 原始輸出")
+    branches = {h.lower(): br for h, br in _COMMIT_BRANCH.findall(text)}
+    for h in claimed_hashes(text):
+        full = next((f for f in log if f.startswith(h)), "")
+        show_full = next((f for f in shows if f.startswith(h)), "")
+        info: Dict[str, Any] = {"hash": h, "exists": bool(full), "subject": log.get(full, ""), "files": [],
+                                "branches": [branches[h]] if h in branches else []}
+        if not full:
+            issues.append(f"COMMIT `{h}` 不在貼出的 git log 原始輸出裡")
+        if not show_full:
+            issues.append(f"缺少 COMMIT `{h}` 的 `git show --stat` 原始輸出（GITSHOW 開頭那段）")
+        else:
+            sh = shows[show_full]
+            info["files"] = sh["files"][:40]
+            if full and sh["subject"] != log[full]:
+                issues.append(f"COMMIT `{h}` 在 git log 和 git show 的標題不一致")
+            if not sh["summary"]:
+                issues.append(f"COMMIT `{h}` 的 git show --stat 輸出缺少「N files changed」統計行")
+        facts["commits"].append(info)
+    return facts
+
+
 def facts_summary(facts: Dict[str, Any]) -> str:
     if not facts.get("is_repo"):
         return "（無法在本機查核：不是 git repo 或是遠端專案）"
-    lines = [f"目前分支：{facts.get('branch')}",
+    lines = (["（遠端專案：以下依代理貼出的 git 原始輸出整理，助理已檢查彼此是否一致）"] if facts.get("remote") else []) + [
+             f"目前分支：{facts.get('branch')}",
              f"未 commit 的變更：{len(facts.get('dirty') or [])} 項",
              "報告提到的 commit："]
     for c in facts.get("commits") or []:
