@@ -30,7 +30,9 @@ from ai_settings import AISettings
 from config import AppConfig
 from projects import ProjectDetector, ProjectWindow
 import driver as drv
-from sessions import SessionStore, now_str, read_kiro_specs, read_plans, write_daily_summary
+import driver_p2 as drv2
+import verifier
+from sessions import SessionStore, now_str, phase_of, read_kiro_specs, read_plans, write_daily_summary
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(BASE_DIR, "automation.log")
@@ -519,6 +521,9 @@ class AutomationWorker(threading.Thread):
     def request_summary(self) -> None:
         self.commands.put(("summary",))
 
+    def request_rollover(self, key: str) -> None:
+        self.commands.put(("rollover", key))
+
     def _process_commands(self) -> None:
         while True:
             try:
@@ -530,6 +535,8 @@ class AutomationWorker(threading.Thread):
                     self._do_send(cmd[1], cmd[2])
                 elif cmd[0] == "click":
                     self._do_click(cmd[1], cmd[2])
+                elif cmd[0] == "rollover":
+                    self._do_rollover_key(cmd[1])
                 elif cmd[0] == "summary":
                     path = write_daily_summary(self.store, datetime.date.today().isoformat())
                     self._log(f"📝 已產生每日摘要：{path}")
@@ -542,11 +549,12 @@ class AutomationWorker(threading.Thread):
     def _session_for(self, w: ProjectWindow):
         return self.store.get(w.key, w.app_label, w.project, w.path, w.remote)
 
-    def _do_send(self, key: str, text: str) -> None:
-        """使用者在面板上按「送出」：先讀 progress、記錄打算做的事，再輸入。"""
-        def fail(why: str) -> None:
+    def _do_send(self, key: str, text: str, by: str = "user") -> bool:
+        """送出訊息（使用者在面板上按「送出」，或自動駕駛）：先讀 progress、記錄打算做的事，再輸入。"""
+        def fail(why: str) -> bool:
             self._log(f"⛔ 送出失敗（{key}）：{why}")
             self._emit("send_result", key=key, ok=False, text=why)
+            return False
 
         text = (text or "").strip()
         if not text:
@@ -564,8 +572,8 @@ class AutomationWorker(threading.Thread):
             return fail(f"訊息命中危險規則 /{hit}/")
         sess = self._session_for(w)
         progress = sess.load()  # 每次操作前先讀 progress
-        sess.history("intent", action="send", text=text, by="user", progress=progress.status_summary,
-                     goal=progress.goal[:120])
+        sess.history("intent", action="send", text=text, by=by, progress=progress.status_summary,
+                     goal=progress.goal[:120], phase=phase_of(progress))
         uw = ud.UiaWindow(w.hwnd)
         inp = uw.chat_input()
         if inp is None:
@@ -591,19 +599,32 @@ class AutomationWorker(threading.Thread):
                 st.goal_question_sent_at = now_str()
             if drv.DOCS_QUESTION[:12] in text:
                 st.docs_question_sent_at = now_str()
-            st.add_interaction("sent", text)
+            if text.startswith(drv2.SPEC_MARK):
+                st.spec_requested_at = now_str()
+                st.spec_round += 1
+            if text.startswith(drv2.REPORT_MARK):
+                st.evidence_requested_at = now_str()
+                st.evidence_attempts += 1
+            if text.startswith(drv2.CONTINUE_MARK):
+                st.sends_in_conversation = 0
+                st.recent_tails = []
+            st.sends_in_conversation += 1
+            if by == "assistant":
+                st.auto_send_times = (st.auto_send_times + [now_str()])[-50:]
+            st.add_interaction("sent" if by == "user" else "auto_sent", text)
             st.suggested_action, st.suggested_prompt, st.suggested_reason = "wait", "", "已送出，等待代理回應"
             st.suggested_at = now_str()
             st.last_panel_hash = ""
 
         sess.update(mutate, self._specs_for(w))
-        sess.history("action", action="send", text=text, by="user")
+        sess.history("action", action="send", text=text, by=by)
         ws = self.states.setdefault(w.hwnd, WinState())
         ws.cooldown_until = time.monotonic() + 5.0
         ws.last_fp_text, ws.last_fp_img, ws.last_analysis = "", None, 0.0
         self._log(f"⌨ [{self._app_name(w)}] 已送出：{text[:60]}")
         self._emit("send_result", key=key, ok=True, text="已送出")
-        self._session(w, "已送出訊息，等待代理回應")
+        self._session(w, ("🤖 自動送出" if by == "assistant" else "已送出訊息") + "，等待代理回應")
+        return True
 
     def _specs_for(self, w: ProjectWindow) -> List[Dict[str, Any]]:
         return self._context_for(w)[0]
@@ -659,6 +680,94 @@ class AutomationWorker(threading.Thread):
         self._log(f"🖱 [{self._app_name(w)}] 已代按「{b.name}」")
         self._emit("send_result", key=key, ok=True, text=f"已代按「{b.name}」")
         self._session(w, f"已代按「{b.name}」，等待代理繼續")
+
+    # ---- P2：自動駕駛
+    def _auto_allowed(self, w: ProjectWindow) -> bool:
+        """自動操作（送出、依規則代按）的總開關：全域不是觀察模式，且這個工作階段打開自動駕駛、沒有被暫停。"""
+        if self.cfg.ai_dry_run:
+            return False
+        try:
+            st = self._session_for(w).load()
+        except OSError:
+            return False
+        return st.autopilot and not st.paused_reason
+
+    def _pause(self, w: ProjectWindow, reason: str) -> None:
+        sess = self._session_for(w)
+
+        def mutate(st) -> None:
+            st.paused_reason = reason
+            if reason not in st.pending_human:
+                st.pending_human.append(reason)
+            st.add_interaction("paused", reason)
+
+        sess.update(mutate)
+        sess.history("paused", text=reason)
+        self._log(f"⏸ [{self._app_name(w)}] 自動駕駛暫停：{reason}")
+        self._session(w, f"⏸ 自動駕駛暫停：{reason}")
+        self._emit("humans", items=self.human_list(), alert=True)
+        try:
+            wu.flash_window(w.hwnd)
+        except Exception:
+            pass
+
+    def _maybe_autosend(self, w: ProjectWindow) -> None:
+        if not self._auto_allowed(w):
+            return
+        sess = self._session_for(w)
+        st = sess.load()
+        if not st.suggested_prompt or st.agent_state == "working" or st.pending_approval:
+            return
+        n = drv2.sends_last_hour(st.auto_send_times)
+        if n >= int(self.cfg.autopilot_max_per_hour):
+            self._session(w, f"⏳ 已達每小時自動送出上限（{n} 次），稍後再送")
+            return
+        if wu.idle_seconds() < self.cfg.ai_idle_sec or wu.modifier_keys_down():
+            self._session(w, f"⏳ 等你停止操作 {self.cfg.ai_idle_sec:.0f} 秒後自動送出")
+            return
+        if (phase_of(st) == "build" and st.sends_in_conversation >= int(self.cfg.rollover_after_sends)
+                and st.suggested_action != "rollover"):
+            self._log(f"🔄 [{self._app_name(w)}] 這個對話已送出 {st.sends_in_conversation} 則，開新對話接續")
+            self._do_rollover(w)
+            return
+        if st.suggested_action == "rollover":
+            self._do_rollover(w)
+            return
+        self._do_send(w.key, st.suggested_prompt, by="assistant")
+
+    def _do_rollover_key(self, key: str) -> None:
+        wins = [p for p in self.detector.detect() if p.key == key and p.project]
+        if not wins:
+            self._emit("send_result", key=key, ok=False, text="找不到這個工作階段的視窗")
+            return
+        self._do_rollover(wins[0])
+
+    def _do_rollover(self, w: ProjectWindow) -> bool:
+        """開新的聊天對話，並送出用 progress 整理的接續摘要。"""
+        if not self.cfg.is_authorized(w.key) or not self._still_authorized(w):
+            return False
+        uw = ud.UiaWindow(w.hwnd)
+        btn = None
+        for name in ("New session", "New Conversation", "New Chat", "新對話"):
+            btn = ud.pick_button(uw.buttons(), name)
+            if btn is not None:
+                break
+        if btn is None or not ud.invoke(btn.control):
+            self._emit("send_result", key=w.key, ok=False, text="找不到「開新對話」按鈕，請手動開新對話後再送出")
+            return False
+        sess = self._session_for(w)
+        sess.history("action", action="rollover", button=btn.name)
+        time.sleep(2.5)
+        st = sess.load()
+        ok = self._do_send(w.key, drv2.build_continuation_prompt(st), by="assistant")
+
+        def mutate(s) -> None:
+            s.rollovers += 1
+            s.recent_tails = []
+            s.add_interaction("rollover", "開新對話並送出接續摘要")
+
+        sess.update(mutate)
+        return ok
 
     def _maybe_daily_summary(self) -> None:
         today = datetime.date.today().isoformat()
@@ -720,6 +829,8 @@ class AutomationWorker(threading.Thread):
         nothing_new = bool(h) and h == snap.last_panel_hash and bool(snap.suggested_at)
         if agent_state == "working" or not self.cfg.driver_enabled or nothing_new:
             sess.update(base, specs, plans)
+            if agent_state != "working" and self.cfg.driver_enabled:
+                self._maybe_autosend(w)
             return
 
         candidates = drv.doc_candidates(specs, plans)
@@ -775,8 +886,134 @@ class AutomationWorker(threading.Thread):
             self._session(w, f"💡 {reason}{hint}")
             return
 
+        phase = phase_of(snap)
+        if phase == "done":
+            sess.update(base, specs, plans)
+            self._session(w, "🎉 目標已達成並查核通過，助理不再推進")
+            return
+        if phase == "spec":
+            self._drive_spec(w, sess, snap, panel_text, judge, specs, plans, candidates, h, base, record_props)
+        else:
+            self._drive_build(w, sess, snap, vs, panel_text, judge, specs, plans, candidates, h, base, record_props)
+        self._maybe_autosend(w)
+
+    def _set_suggestion(self, w, sess, specs, plans, h, base, record_props, action: str, prompt: str, reason: str,
+                        extra=None) -> None:
+        hit = check_deny([prompt], self.cfg.deny_patterns) if prompt else None
+        if hit:
+            action, prompt, reason = "ask_human", "", f"建議的訊息命中危險規則 /{hit}/"
+
+        def mutate(st) -> None:
+            base(st)
+            record_props(st)
+            st.last_panel_hash = h
+            st.suggested_action, st.suggested_prompt, st.suggested_reason = action, prompt, reason
+            st.suggested_at = now_str()
+            if action == "ask_human" and reason not in st.pending_human:
+                st.pending_human.append(reason)
+            if extra:
+                extra(st)
+            st.add_interaction("suggest", f"{action}：{reason}")
+
+        sess.update(mutate, specs, plans)
+        sess.history("suggest", action=action, prompt=prompt, reason=reason)
+        if hit:
+            sess.history("blocked", text=f"建議的訊息命中 /{hit}/")
+        if action == "ask_human":
+            sess.history("ask_human", text=reason)
+        self._log(f"💡 [{self._app_name(w)}] {action}：{reason}")
+        hint = "｜按「目標／建議」查看並送出" if prompt else ""
+        self._session(w, f"💡 {action}：{reason}{hint}")
+
+    def _local_path(self, w: ProjectWindow) -> str:
+        return w.path if (w.path and not w.remote and os.path.isdir(w.path)) else ""
+
+    def _drive_spec(self, w, sess, snap, panel_text, judge, specs, plans, candidates, h, base, record_props) -> None:
+        """② 與代理討論出驗收 spec；定稿後等使用者確認。"""
+        args = (w, sess, specs, plans, h, base, record_props)
+        spec_file = os.path.join(sess.dir, "acceptance_draft.md") if self._local_path(w) else ""
+        if not snap.spec_requested_at:
+            self._set_suggestion(*args, "request_spec", drv2.build_spec_request(snap, spec_file),
+                                 "目標已確認；先請代理提出詳細、可檢查的驗收 spec")
+            return
+        if snap.acceptance and not snap.spec_issues and "確認驗收 spec" in snap.pending_human:
+            self._set_suggestion(*args, "await_spec_confirm", "", "驗收 spec 已定稿，請在面板上確認後才開始實作")
+            return
+        text = drv2.read_new_file(spec_file, snap.spec_requested_at) or panel_text
+        items = drv2.parse_spec_items(judge.chat(drv2.build_spec_extract_prompt(text, snap.goal),
+                                                 max_tokens=2000, temperature=0))
+        if not items:
+            self._drive_generic(w, sess, snap, {"agent_state": snap.agent_state}, panel_text, judge, specs, plans,
+                                candidates, h, base, record_props)
+            return
+        ok, issues, needs = drv2.parse_spec_review(judge.chat(drv2.build_spec_review_prompt(snap.goal, items),
+                                                              max_tokens=1200, temperature=0))
+        sess.history("spec_review", items=len(items), ok=ok, issues=issues, needs_user=needs, round=snap.spec_round)
+
+        def store(st) -> None:
+            st.acceptance = items
+            st.spec_issues = issues
+
+        if needs:
+            def ask(st) -> None:
+                store(st)
+                for n in needs:
+                    if n not in st.pending_human:
+                        st.pending_human.append(f"驗收 spec 需要你決定：{n}")
+            self._set_suggestion(*args, "ask_human", "", "驗收 spec 有需要你決定的取捨：" + "；".join(needs), ask)
+        elif not ok and snap.spec_round < drv2.MAX_SPEC_ROUNDS:
+            self._set_suggestion(*args, "revise_spec", drv2.build_spec_revise(issues, spec_file),
+                                 f"驗收 spec 還不夠具體（第 {snap.spec_round} 輪），請代理修改", store)
+        else:
+            def final(st) -> None:
+                store(st)
+                if "確認驗收 spec" not in st.pending_human:
+                    st.pending_human.append("確認驗收 spec")
+            reason = "驗收 spec 已定稿，請在面板上確認後才開始實作"
+            if issues:
+                reason += f"（已討論 {snap.spec_round} 輪，仍有意見，請你判斷）"
+            self._set_suggestion(*args, "await_spec_confirm", "", reason, final)
+            self._emit("humans", items=self.human_list(), alert=True)
+
+    def _drive_build(self, w, sess, snap, vs, panel_text, judge, specs, plans, candidates, h, base, record_props) -> None:
+        """③ 實作與查核證據：要報告 → 唯讀查核 → 有問題就回給代理，直到全部通過。"""
+        args = (w, sess, specs, plans, h, base, record_props)
+        tail = drv2.agent_tail(panel_text)
+        local = self._local_path(w)
+        if snap.evidence_requested_at:
+            self._verify_report(w, sess, snap, panel_text, judge, args, local)
+            return
+        if drv2.is_looping(snap.recent_tails, tail):
+            sess.history("loop", text="代理連續 3 次停在幾乎相同的內容")
+            if self._auto_allowed(w) and snap.rollovers < 2:
+                self._set_suggestion(*args, "rollover", drv2.build_continuation_prompt(snap),
+                                     "代理在原地打轉，開新對話並用進度摘要接續")
+            elif snap.autopilot:
+                self._pause(w, "代理在原地打轉，開新對話後仍未改善")
+                self._set_suggestion(*args, "ask_human", "", "代理在原地打轉，需要你看一下")
+            else:
+                self._set_suggestion(*args, "rollover", drv2.build_continuation_prompt(snap),
+                                     "代理在原地打轉，建議開新對話並送出接續摘要（按「開新對話並送出」）")
+            return
+        self._drive_generic(w, sess, snap, vs, panel_text, judge, specs, plans, candidates, h, base, record_props,
+                            tail=tail)
+
+    def _drive_generic(self, w, sess, snap, vs, panel_text, judge, specs, plans, candidates, h, base, record_props,
+                       tail: str = "") -> None:
         sug = drv.parse_suggestion(judge.chat(drv.build_suggest_prompt(snap, vs, panel_text, candidates),
                                               max_tokens=1200, temperature=0))
+        # 代理宣稱完成時，改用固定格式要求測試報告（含故意弄壞與 commit），不採用模型自由發揮的版本
+        if phase_of(snap) == "build" and (sug["action"] == "request_evidence" or sug["new_claims"]):
+            report = os.path.join(sess.dir, "reports", drv2.report_filename()) if self._local_path(w) else ""
+            if report:
+                os.makedirs(os.path.dirname(report), exist_ok=True)
+            sug = dict(sug, action="request_evidence", prompt=drv2.build_evidence_request(snap, report),
+                       reason=sug["reason"] or "代理宣稱完成，要求測試報告與證據")
+
+            def keep_report(st, report=report) -> None:
+                st.report_path = report
+        else:
+            keep_report = None
         hit = check_deny([sug["prompt"]], self.cfg.deny_patterns) if sug["prompt"] else None
 
         def with_goal(st) -> None:
@@ -784,6 +1021,10 @@ class AutomationWorker(threading.Thread):
             record_props(st)
             st.last_panel_hash = h
             drv.apply_suggestion(st, sug, hit)
+            if tail:
+                st.recent_tails = (st.recent_tails + [tail])[-5:]
+            if keep_report:
+                keep_report(st)
             st.add_interaction("suggest", f"{st.suggested_action}：{st.suggested_reason}")
 
         st = sess.update(with_goal, specs, plans)
@@ -795,6 +1036,66 @@ class AutomationWorker(threading.Thread):
         self._log(f"💡 [{self._app_name(w)}] 建議 {st.suggested_action}：{st.suggested_reason}")
         hint = "｜按「目標／建議」查看並送出" if st.suggested_prompt else ""
         self._session(w, f"💡 建議 {st.suggested_action}：{st.suggested_reason}{hint}")
+
+    def _verify_report(self, w, sess, snap, panel_text, judge, args, local: str) -> None:
+        report = drv2.read_new_file(snap.report_path, snap.evidence_requested_at) if snap.report_path else ""
+        source = snap.report_path if report else "聊天內容"
+        if not report:
+            report = panel_text[-9000:]
+        facts = verifier.gather_facts(local, report) if local else {"is_repo": False}
+        det = verifier.deterministic_issues(facts, report, remote=not local)
+        results, issues = drv2.parse_verify(
+            judge.chat(drv2.build_verify_prompt(snap, report, verifier.facts_summary(facts), det),
+                       max_tokens=1500, temperature=0), len(snap.acceptance), det)
+        sess.history("verify", source=source, results=[[i, ok, r] for i, ok, r in results], issues=issues,
+                     commits=[c.get("hash") for c in facts.get("commits", [])])
+
+        def apply(st) -> None:
+            for idx, ok, reason in results:
+                if idx < len(st.acceptance) and ok:
+                    if st.acceptance[idx].get("status") != "verified":
+                        st.evidence.append({"time": now_str(), "text": f"條件 {idx + 1}「{st.acceptance[idx]['text'][:40]}」：{reason}（來源：{source}）"})
+                    st.acceptance[idx]["status"] = "verified"
+            for c in facts.get("commits", []):
+                check = f"✅ 存在（分支 {facts.get('branch', '')}）" if c.get("exists") else "❌ repo 裡找不到"
+                known = [x for x in st.commits if x.get("hash", "")[:7] == c["hash"][:7]]
+                if known:
+                    known[0]["check"] = check
+                else:
+                    st.commits.append({"time": now_str(), "branch": facts.get("branch", ""), "hash": c["hash"][:12],
+                                       "desc": c.get("subject", "")[:120], "check": check})
+            st.last_issues = issues
+            st.evidence_requested_at = ""
+            if st.acceptance and all(a.get("status") == "verified" for a in st.acceptance):
+                st.done_at = now_str()
+                st.autopilot = False
+                st.claims_unverified = []
+                if "目標已達成，請你驗收" not in st.pending_human:
+                    st.pending_human.append("目標已達成，請你驗收")
+
+        st = sess.update(apply, self._specs_for(w))
+        if st.done_at:
+            self._set_suggestion(*args, "done", "", "所有驗收條件都已查核通過；已停止推進並關閉自動駕駛")
+            self._log(f"🎉 [{self._app_name(w)}] 目標已達成並查核通過")
+            self._emit("humans", items=self.human_list(), alert=True)
+            return
+        if issues:
+            if st.evidence_attempts >= int(self.cfg.evidence_max_attempts):
+                if st.autopilot:
+                    self._pause(w, f"連續 {st.evidence_attempts} 次要不到合格的證據")
+                self._set_suggestion(*args, "ask_human", "",
+                                     f"連續 {st.evidence_attempts} 次要不到合格的證據，需要你看一下")
+                return
+            report_file = os.path.join(sess.dir, "reports", drv2.report_filename()) if local else ""
+            if report_file:
+                os.makedirs(os.path.dirname(report_file), exist_ok=True)
+            self._set_suggestion(*args, "request_evidence", drv2.build_evidence_request(st, report_file, issues),
+                                 f"查核發現 {len(issues)} 個問題，請代理補正",
+                                 lambda s, r=report_file: setattr(s, "report_path", r))
+            return
+        todo = [a["text"] for a in st.acceptance if a.get("status") != "verified"]
+        prompt = "查核通過的部分已記錄。請在功能分支上繼續處理下一個未完成的驗收條件：\n" + "\n".join(f"- {t}" for t in todo)
+        self._set_suggestion(*args, "next_task", prompt, f"已查核通過 {len(st.acceptance) - len(todo)}/{len(st.acceptance)} 條")
 
     # ---- 階段一：UIA 按鈕模式
     def _uia_round(self) -> None:
@@ -904,8 +1205,9 @@ class AutomationWorker(threading.Thread):
             return
         state = str(vs.get("agent_state", ""))
         summary = str(vs.get("summary", ""))
+        approvals_now = ud.approval_buttons(buttons, panel_rect)
         try:
-            self._drive(w, vs, panel_text, judge, ud.approval_buttons(buttons, panel_rect))
+            self._drive(w, vs, panel_text, judge, approvals_now)
         except AIError as e:
             self._log(f"⚠ [{app}] 驅動器：{e}")
         if state in NO_ACTION_STATES:
@@ -915,6 +1217,11 @@ class AutomationWorker(threading.Thread):
             st.last_kind = "wait"
             return
 
+        if self.cfg.driver_enabled and not approvals_now and not (
+                state == "asking_choice" and any(o["button"] for o in normalize_options(vs))):
+            # 打字類的回應（繼續、回覆、選項代號）統一由驅動器決定，避免同一個停頓被回兩次
+            st.last_kind = "wait"
+            return
         fixed = ground_with_uia(vs, panel_text)
         if fixed:
             self._log(f"🔎 [{app}] 已用 UIA 原文校正 OCR：{', '.join(fixed)}")
@@ -946,6 +1253,9 @@ class AutomationWorker(threading.Thread):
         self._session(w, f"{state} → {plan.kind}：{plan.reason}")
 
         if plan.kind == "wait":
+            st.last_kind = "wait"
+            return
+        if self.cfg.driver_enabled and plan.kind in ("continue", "reply", "choose"):
             st.last_kind = "wait"
             return
         if plan.kind == "ask_human":
@@ -1006,12 +1316,12 @@ class AutomationWorker(threading.Thread):
         progress = sess.load()
         sess.history("intent", action=plan.kind, detail=(plan.button or plan.text)[:200], reason=plan.reason,
                      dry_run=self.cfg.ai_dry_run, progress=progress.status_summary)
-        if self.cfg.ai_dry_run:
+        if not self._auto_allowed(w):
             st.last_kind = plan.kind
             st.pending = None
             detail = plan.button or plan.text
-            self._log(f"👀 [{app}] 觀察模式，不執行：{plan.kind} {detail[:80]}")
-            self._session(w, f"👀 觀察模式：打算 {plan.kind} {detail[:40]}")
+            self._log(f"👀 [{app}] 未開自動駕駛（或全域觀察模式），不執行：{plan.kind} {detail[:80]}")
+            self._session(w, f"👀 只建議：打算 {plan.kind} {detail[:40]}（開自動駕駛才會執行）")
             return
 
         if not self._still_authorized(w):

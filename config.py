@@ -38,7 +38,7 @@ def _default_deny_patterns() -> List[str]:
         r"\bdel\s+/[sq]",
         r"\brmdir\s+/s",
         r"\bformat\s+[a-z]:",
-        r"git\s+push\b.*(--force|-f\b)",
+        r"git\s+push\b",  # Q12：所有 push 都交給使用者（含一般 push）
         r"git\s+reset\s+--hard",
         r"git\s+clean\s+-[a-z]*f",
         r"\bdrop\s+(table|database|schema)\b",
@@ -99,6 +99,10 @@ class AppConfig:
     driver_enabled: bool = True
     # 每日摘要產生時間（HH:MM）
     daily_summary_time: str = "18:00"
+    # P2 自動駕駛（各工作階段另外要打開「自動駕駛」才會生效）
+    autopilot_max_per_hour: float = 12.0
+    evidence_max_attempts: float = 3.0
+    rollover_after_sends: float = 30.0
 
     @classmethod
     def load(cls, path: str = DEFAULT_CONFIG_PATH) -> "AppConfig":
@@ -134,6 +138,9 @@ class AppConfig:
             cfg.mode = "ai"
         if cfg.basic_mode not in ("image", "uia"):
             cfg.basic_mode = "uia"
+        # Q12（2026-11-16）：一般 push 也交給使用者。舊設定檔只擋強制推送，補上這條
+        if r"git\s+push\b" not in cfg.deny_patterns:
+            cfg.deny_patterns.append(r"git\s+push\b")
         return cfg
 
     def is_authorized(self, key: str) -> bool:

@@ -17,7 +17,7 @@ from automation import AutomationWorker, make_clients
 from config import AppConfig, DEFAULT_CONFIG_PATH
 from projects import ProjectDetector, ProjectWindow
 from driver import build_docs_question, build_goal_question, doc_candidates
-from sessions import now_str, read_kiro_specs, read_plans
+from sessions import now_str, phase_label, phase_of, read_kiro_specs, read_plans
 from uia_driver import name_in as ud_name_in
 from clicker import ClickController
 from scanner import ScreenScanner, read_image_unicode, write_image_unicode
@@ -919,8 +919,8 @@ class SessionDialog:
         sw, sh = app.root.winfo_screenwidth(), app.root.winfo_screenheight()
         x = app.root.winfo_rootx() - 470
         x = x if x >= 0 else min(app.root.winfo_rootx() + app.root.winfo_width() + 10, sw - 470)
-        y = max(0, min(app.root.winfo_rooty(), sh - 840))
-        self.win.geometry(f"460x{min(760, sh - 80)}+{max(0, x)}+{y}")
+        y = max(0, min(app.root.winfo_rooty(), sh - 900))
+        self.win.geometry(f"460x{min(860, sh - 60)}+{max(0, x)}+{y}")
         body = tk.Frame(self.win, bg=BG, padx=10, pady=8)
         body.pack(fill="both", expand=True)
 
@@ -954,6 +954,32 @@ class SessionDialog:
         self.adopt_btn = _button(grow, "採用代理說明的目標", self.adopt_agent_goal)
         self.adopt_btn.pack(side="left", padx=6)
 
+        self.p2_box = tk.LabelFrame(body, text=" 🚦 階段與自動駕駛 ", bg=BG, fg="#F472B6", font=FONT_B, padx=6, pady=4)
+        self.p2_box.pack(fill="x", pady=(0, 4))
+        prow = tk.Frame(self.p2_box, bg=BG)
+        prow.pack(fill="x")
+        self.phase_lbl = _label(prow, "", font=FONT_B)
+        self.phase_lbl.pack(side="left")
+        self.autopilot_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(prow, text="自動駕駛", variable=self.autopilot_var, command=self.toggle_autopilot, bg=BG,
+                       fg="#F8FAFC", selectcolor=BG2, activebackground=BG, font=FONT_B).pack(side="right")
+        self.ap_info = _label(self.p2_box, "", fg=FG_DIM, font=FONT_S, wraplength=420, justify="left")
+        self.ap_info.pack(anchor="w")
+        self.pause_row = tk.Frame(self.p2_box, bg=BG)
+        self.pause_lbl = _label(self.pause_row, "", fg="#F87171", font=FONT_S, wraplength=330, justify="left")
+        self.pause_lbl.pack(side="left")
+        _button(self.pause_row, "恢復自動駕駛", self.resume_autopilot).pack(side="right")
+        self.acc_list = tk.Listbox(self.p2_box, height=4, bg=BG2, fg="#FFFFFF", font=("Microsoft JhengHei UI", 8),
+                                   activestyle="none", bd=0, highlightthickness=0, selectbackground=BG2)
+        self.acc_list.pack(fill="x", pady=(2, 2))
+        arow = tk.Frame(self.p2_box, bg=BG)
+        arow.pack(fill="x")
+        self.confirm_btn = _button(arow, "✅ 確認驗收 spec", self.confirm_spec, bg="#0284C7")
+        self.confirm_btn.pack(side="left")
+        self.rollover_btn = _button(arow, "🔄 開新對話並送出", self.rollover)
+        self.rollover_btn.pack(side="left", padx=6)
+        _button(arow, "報告資料夾", lambda: FloatingOverlayApp._open_path(self.sess.reports_dir)).pack(side="right")
+
         self.proposal_box = tk.LabelFrame(body, text=" 🤖 代理說明的最終目標（待你採用） ", bg=BG, fg="#A78BFA",
                                           font=FONT_B, padx=6, pady=4)
         self.proposal_lbl = _label(self.proposal_box, "", font=FONT_S, wraplength=420, justify="left")
@@ -964,7 +990,7 @@ class SessionDialog:
         self.docs_box.pack(fill="x", pady=(2, 4))
         lb_row = tk.Frame(self.docs_box, bg=BG)
         lb_row.pack(fill="x")
-        self.docs_list = tk.Listbox(lb_row, selectmode="multiple", height=6, bg=BG2, fg="#FFFFFF",
+        self.docs_list = tk.Listbox(lb_row, selectmode="multiple", height=4, bg=BG2, fg="#FFFFFF",
                                     selectbackground="#0284C7", selectforeground="#FFFFFF", font=("Consolas", 8),
                                     activestyle="none", bd=0, highlightthickness=0, exportselection=False)
         self.docs_list.pack(side="left", fill="x", expand=True)
@@ -997,7 +1023,7 @@ class SessionDialog:
         sbox.pack(fill="both", expand=True)
         self.sug_info = _label(sbox, "", font=FONT_S, wraplength=420, justify="left")
         self.sug_info.pack(anchor="w")
-        self.sug_text = tk.Text(sbox, height=6, bg=BG2, fg="#FFFFFF", insertbackground="#FFFFFF", wrap="word",
+        self.sug_text = tk.Text(sbox, height=5, bg=BG2, fg="#FFFFFF", insertbackground="#FFFFFF", wrap="word",
                                 font=FONT, bd=0)
         self.sug_text.pack(fill="both", expand=True, pady=(2, 2))
         _label(sbox, "可以先修改上面的文字再送出。送出時會短暫切到 IDE 視窗輸入，再切回來。", fg=FG_DIM, font=FONT_S,
@@ -1013,6 +1039,7 @@ class SessionDialog:
             self.goal_text.edit_modified(False)
         self.goal_info.configure(text=f"{st.goal_confirmed_at} 確認" if st.goal_confirmed_at else
                                  "尚未設定。進行中的專案可先送出下方的「詢問最終目標」，代理回答後再採用或修改。")
+        self._fill_p2(st)
         if st.agent_goal_proposal:
             self.proposal_lbl.configure(text=st.agent_goal_proposal)
             self.proposal_box.pack(fill="x", pady=(0, 4), before=self.docs_box)
@@ -1046,6 +1073,87 @@ class SessionDialog:
             self.sug_text.delete("1.0", "end")
             self.sug_text.insert("1.0", prompt)
             self.sug_text.edit_modified(False)
+
+    def _fill_p2(self, st) -> None:
+        phase = phase_of(st)
+        self.phase_lbl.configure(text=f"階段：{phase_label(st)}")
+        self.autopilot_var.set(st.autopilot)
+        notes = []
+        if self.app.cfg.ai_dry_run:
+            notes.append("⚠ 「AI 設定」的全域觀察模式開著：自動駕駛不會實際動作，只寫建議")
+        if st.autopilot:
+            notes.append(f"自動駕駛開著：代理停下來且你閒置 {self.app.cfg.ai_idle_sec:.0f} 秒後自動送出建議，"
+                         f"每小時最多 {int(self.app.cfg.autopilot_max_per_hour)} 次；Allow 依危險規則與風險門檻代按")
+        else:
+            notes.append("自動駕駛關著：只寫建議，送出要你按")
+        if phase == "spec" and st.acceptance and not st.acceptance_confirmed_at:
+            notes.append("驗收 spec 草稿已出來：確認後才會開始實作")
+        self.ap_info.configure(text="\n".join(notes))
+        if st.paused_reason:
+            self.pause_lbl.configure(text=f"⏸ 已暫停：{st.paused_reason}")
+            self.pause_row.pack(fill="x", after=self.ap_info)
+        else:
+            self.pause_row.pack_forget()
+        self.acc_list.delete(0, "end")
+        icon = {"verified": "✅", "claimed": "🟡", "todo": "⬜"}
+        for a in st.acceptance:
+            self.acc_list.insert("end", f"{icon.get(a.get('status', 'todo'), '⬜')} {a.get('text', '')}")
+        if not st.acceptance:
+            self.acc_list.insert("end", "（驗收條件尚未提出）")
+        can_confirm = bool(st.acceptance) and not st.acceptance_confirmed_at
+        self.confirm_btn.configure(state="normal" if can_confirm else "disabled")
+        self.rollover_btn.configure(state="normal" if st.goal else "disabled")
+
+    def toggle_autopilot(self) -> None:
+        on = bool(self.autopilot_var.get())
+        if on and not self.app.cfg.is_authorized(self.pw.key):
+            self.autopilot_var.set(False)
+            self.result_lbl.configure(text="這個工作階段沒有勾選，不能開自動駕駛。", fg="#F87171")
+            return
+
+        def mutate(st) -> None:
+            st.autopilot = on
+            if on:
+                st.paused_reason = ""
+            st.add_interaction("autopilot", "開" if on else "關")
+
+        self.sess.update(mutate)
+        self.sess.history("autopilot", on=on, by="user")
+        self.result_lbl.configure(text="自動駕駛已開啟。" if on else "自動駕駛已關閉。", fg="#34D399" if on else FG_DIM)
+        self.reload()
+
+    def resume_autopilot(self) -> None:
+        def mutate(st) -> None:
+            reason = st.paused_reason
+            st.paused_reason = ""
+            st.evidence_attempts = 0
+            st.pending_human = [p for p in st.pending_human if p != reason]
+            st.add_interaction("resume", "使用者恢復自動駕駛")
+
+        self.sess.update(mutate)
+        self.sess.history("resume", by="user")
+        self.reload()
+
+    def confirm_spec(self) -> None:
+        def mutate(st) -> None:
+            st.acceptance_confirmed_at = now_str()
+            st.pending_human = [p for p in st.pending_human if "驗收 spec" not in p]
+            st.spec_issues = []
+            st.suggested_action, st.suggested_prompt = "next_task", (
+                "驗收 spec 已確認。請建立功能分支，依驗收條件逐條實作；每完成一條就 commit 並回報 commit hash（不要 push）。")
+            st.suggested_reason = "使用者已確認驗收 spec，開始實作"
+            st.suggested_at = now_str()
+            st.add_interaction("spec_confirmed", f"{len(st.acceptance)} 條")
+
+        self.sess.update(mutate)
+        self.sess.history("spec_confirmed", by="user")
+        self.result_lbl.configure(text="已確認驗收 spec。下方是開始實作的訊息，可以修改後送出（自動駕駛開著會自動送出）。",
+                                  fg="#34D399")
+        self.reload()
+
+    def rollover(self) -> None:
+        self.result_lbl.configure(text="開新對話並送出接續摘要中…", fg=FG_DIM)
+        self.app.worker.request_rollover(self.pw.key)
 
     def _fill_docs(self, st, candidates: List[Dict[str, Any]]) -> None:
         self.candidates = candidates

@@ -68,6 +68,24 @@ class SessionState:
     approval_buttons: List[str] = field(default_factory=list)
     interactions: List[Dict[str, str]] = field(default_factory=list)
     updated_at: str = ""
+    # ---- P2：自動駕駛與階段
+    autopilot: bool = False           # 這個工作階段允許自動送出與依規則代按
+    paused_reason: str = ""           # 自動駕駛被暫停的原因（要不到證據、原地打轉等）
+    auto_send_times: List[str] = field(default_factory=list)
+    # 驗收 spec 討論
+    spec_requested_at: str = ""
+    spec_round: int = 0
+    spec_issues: List[str] = field(default_factory=list)
+    # 證據與測試報告
+    evidence_requested_at: str = ""
+    evidence_attempts: int = 0
+    report_path: str = ""
+    last_issues: List[str] = field(default_factory=list)
+    done_at: str = ""
+    # 對話過長、原地打轉
+    sends_in_conversation: int = 0
+    recent_tails: List[str] = field(default_factory=list)
+    rollovers: int = 0
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionState":
@@ -101,14 +119,29 @@ def render_progress(s: SessionState, specs: Optional[List[Dict[str, Any]]] = Non
         out.append(f"（{s.goal_confirmed_at} 由使用者確認）")
     if s.agent_goal_proposal and not s.goal:
         out += ["", "### 代理說明的最終目標（待你採用）", s.agent_goal_proposal]
+    out += ["", "## 階段", f"- {phase_label(s)}｜自動駕駛：{'開' if s.autopilot else '關'}"]
+    if s.paused_reason:
+        out.append(f"- ⏸ 自動駕駛已暫停：{s.paused_reason}")
     out += ["", "## 完成定義（驗收條件）"]
     if s.acceptance:
         mark = {"verified": "x", "claimed": "~", "todo": " "}
         for a in s.acceptance:
+            extra = []
+            if a.get("how"):
+                extra.append(f"如何查核：{a['how']}")
+            if a.get("test"):
+                extra.append(f"測試：{a['test']}")
             out.append(f"- [{mark.get(a.get('status', 'todo'), ' ')}] {a.get('text', '')}"
-                       + (f"（如何查核：{a['how']}）" if a.get("how") else ""))
+                       + (f"（{'；'.join(extra)}）" if extra else ""))
+        out.append(f"（{s.acceptance_confirmed_at} 你確認）" if s.acceptance_confirmed_at else "（草稿，等你確認後才開始實作）")
     else:
-        out.append("（尚未定稿，P2 會與代理討論出可檢查的驗收 spec）")
+        out.append("（尚未定稿：助理會請代理提出詳細、可檢查的驗收 spec）")
+    if s.spec_issues and not s.acceptance_confirmed_at:
+        out += ["", "### 助理對驗收 spec 草稿的意見"] + [f"- {x}" for x in s.spec_issues]
+    if s.last_issues:
+        out += ["", "## 最近一次查核發現的問題"] + [f"- {x}" for x in s.last_issues]
+    if s.report_path:
+        out.append(f"\n最近的測試報告：`{s.report_path}`")
     out += ["", "## 正在進行的計畫"]
     if s.active_docs:
         who = "你勾選" if s.active_docs_by == "user" else "採用代理的判斷"
@@ -249,6 +282,23 @@ def read_plans(project_path: str, limit: int = 10, max_depth: int = 5, head_char
     return out
 
 
+def phase_of(s: SessionState) -> str:
+    if not s.goal:
+        return "goal"
+    if not s.acceptance_confirmed_at:
+        return "spec"
+    if s.done_at or (s.acceptance and all(a.get("status") == "verified" for a in s.acceptance)):
+        return "done"
+    return "build"
+
+
+_PHASE_LABEL = {"goal": "① 確認目標", "spec": "② 討論驗收 spec", "build": "③ 實作與查核證據", "done": "④ 已達成目標"}
+
+
+def phase_label(s: SessionState) -> str:
+    return _PHASE_LABEL[phase_of(s)]
+
+
 class Session:
     def __init__(self, directory: str) -> None:
         self.dir = directory
@@ -260,6 +310,10 @@ class Session:
     @property
     def progress_path(self) -> str:
         return os.path.join(self.dir, "progress.md")
+
+    @property
+    def reports_dir(self) -> str:
+        return os.path.join(self.dir, "reports")
 
     def load(self) -> SessionState:
         p = os.path.join(self.dir, "state.json")
