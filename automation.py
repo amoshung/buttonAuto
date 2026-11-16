@@ -159,12 +159,13 @@ def approvals_from_roles(roles: Dict[str, str], controls: List[str], keyword_hit
     if not roles:
         return keyword_hits
     allows = any(roles.get(c) in ("allow_once", "allow_always") for c in controls)
-    if not allows and any(roles.get(c) == "answer" for c in controls):
-        return []  # 一般的提問（選項題），旁邊的 No／Skip 不代表在等允許
-    picked = [c for c in controls if roles.get(c) in APPROVAL_ROLES]
-    if picked:
-        return picked
-    return keyword_hits
+    if not allows:
+        # 沒有任何「允許」類的選項就不是在等允許：例如代理工作中只有 Cancel、或一般提問旁的 No／Skip。
+        # 例外：畫面上確實有 Allow／Run／Accept 按鈕（模型漏標），沿用名稱比對的結果
+        if any(ud.name_in(b, ONE_TIME_ALLOW) for b in keyword_hits):
+            return keyword_hits
+        return []
+    return [c for c in controls if roles.get(c) in APPROVAL_ROLES]
 
 
 def build_state_text(app_name: str, vs: Dict[str, Any], panel_text: str) -> str:

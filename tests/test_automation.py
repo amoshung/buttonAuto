@@ -445,3 +445,9 @@ def test_ask_option_name_keeps_original_text():
     assert ud.ask_option_name("1 Yes, allow this time") == "Yes, allow this time"
     assert ud.ask_option_name("4 No (tell the agent what to do instead) Record voice memo") == \
         "No (tell the agent what to do instead)"
+
+
+def test_cancel_alone_is_not_an_approval():
+    from automation import approvals_from_roles
+    assert approvals_from_roles({"Cancel": "deny", "Add context": "other"}, ["Cancel", "Add context"], []) == []
+    assert approvals_from_roles({"Allow": "other", "Deny": "deny"}, ["Allow", "Deny"], ["Allow", "Deny"]) == ["Allow", "Deny"]
