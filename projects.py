@@ -63,6 +63,17 @@ class ProjectWindow:
         return self.path or "（找不到路徑）"
 
 
+ASSISTANT_DIR = os.path.normcase(os.path.dirname(os.path.abspath(__file__)))
+
+
+def contains_assistant(path: str, remote: str = "") -> bool:
+    """這個專案是不是 AI 工程助理自己（或在它的資料夾裡）。在這種視窗裡自動操作，會干擾控制助理的那個對話。"""
+    if remote or not path:
+        return False
+    p = os.path.normcase(os.path.abspath(path))
+    return p == ASSISTANT_DIR or p.startswith(ASSISTANT_DIR + os.sep)
+
+
 def session_key(app: str, project: str, path: str, remote: str) -> str:
     """工作階段的穩定識別：App + 完整路徑（找不到路徑時退回專案名稱）。"""
     where = path or project

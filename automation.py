@@ -848,13 +848,13 @@ class AutomationWorker(threading.Thread):
     # ---- P2：自動駕駛
     def _auto_allowed(self, w: ProjectWindow) -> bool:
         """自動操作（送出、依規則代按）的總開關：全域不是觀察模式，且這個工作階段打開自動駕駛、沒有被暫停。"""
-        if self.cfg.ai_dry_run:
+        if self.cfg.mode_of(w.key) != "auto":
             return False
         try:
             st = self._session_for(w).load()
         except OSError:
             return False
-        return st.autopilot and not st.paused_reason
+        return not st.paused_reason
 
     def _pause(self, w: ProjectWindow, reason: str) -> None:
         sess = self._session_for(w)
@@ -1193,7 +1193,7 @@ class AutomationWorker(threading.Thread):
             if self._auto_allowed(w) and snap.rollovers < 2:
                 self._set_suggestion(*args, "rollover", drv2.build_continuation_prompt(snap),
                                      "代理在原地打轉，開新對話並用進度摘要接續")
-            elif snap.autopilot:
+            elif self.cfg.mode_of(w.key) == "auto":
                 self._pause(w, "代理在原地打轉，開新對話後仍未改善")
                 self._set_suggestion(*args, "ask_human", "", "代理在原地打轉，需要你看一下")
             else:
@@ -1286,6 +1286,9 @@ class AutomationWorker(threading.Thread):
                     st.pending_human.append(msg)
 
         st = sess.update(apply, self._specs_for(w))
+        if st.done_at and self.cfg.mode_of(w.key) == "auto":
+            self.cfg.set_mode(w.key, "suggest")  # 目標達成：自動駕駛自動關閉
+            self._emit("modes_changed")
         if st.done_at:
             self._set_suggestion(*args, "done", "", "所有驗收條件都已查核通過；已停止推進並關閉自動駕駛")
             self._log(f"🎉 [{self._app_name(w)}] 目標已達成並查核通過")
@@ -1293,7 +1296,7 @@ class AutomationWorker(threading.Thread):
             return
         if issues:
             if st.evidence_attempts >= int(self.cfg.evidence_max_attempts):
-                if st.autopilot:
+                if self.cfg.mode_of(w.key) == "auto":
                     self._pause(w, f"連續 {st.evidence_attempts} 次要不到合格的證據")
                 self._set_suggestion(*args, "ask_human", "",
                                      f"連續 {st.evidence_attempts} 次要不到合格的證據，需要你看一下")
@@ -1560,7 +1563,7 @@ class AutomationWorker(threading.Thread):
         sess = self._session_for(w)
         progress = sess.load()
         sess.history("intent", action=plan.kind, detail=(plan.button or plan.text)[:200], reason=plan.reason,
-                     dry_run=self.cfg.ai_dry_run, progress=progress.status_summary)
+                     auto=self._auto_allowed(w), progress=progress.status_summary)
         if not self._auto_allowed(w):
             st.last_kind = plan.kind
             st.pending = None

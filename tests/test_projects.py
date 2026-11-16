@@ -76,3 +76,23 @@ def test_config_authorization():
     assert cfg.authorized_sessions == ["kiro|d:\\x"]
     cfg.set_authorized("kiro|d:\\x", False)
     assert cfg.authorized_sessions == []
+
+
+def test_session_modes_and_self_detection(tmp_path):
+    import json
+    from projects import ASSISTANT_DIR, contains_assistant
+    cfg = AppConfig()
+    assert cfg.mode_of("k") == "off"
+    cfg.set_mode("k", "auto")
+    assert cfg.mode_of("k") == "auto" and cfg.is_authorized("k")
+    cfg.set_mode("k", "off")
+    assert not cfg.is_authorized("k")
+    cfg.authorized_sessions.append("old")  # 舊設定只有勾選 → 視為只建議
+    assert cfg.mode_of("old") == "suggest"
+    p = tmp_path / "c.json"
+    cfg.set_mode("k", "suggest")
+    cfg.save(str(p))
+    assert AppConfig.load(str(p)).session_modes == {"k": "suggest"}
+    assert contains_assistant(ASSISTANT_DIR) and contains_assistant(os.path.join(ASSISTANT_DIR, "sub"))
+    assert not contains_assistant(os.path.dirname(ASSISTANT_DIR))  # 上層資料夾是別的對話
+    assert not contains_assistant(ASSISTANT_DIR, remote="host")

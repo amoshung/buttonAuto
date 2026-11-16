@@ -120,17 +120,17 @@ def test_full_p2_flow_until_done(tmp_path):
 def test_fake_commit_and_missing_mutation_are_rejected_then_pause(tmp_path):
     path, _ = _repo(tmp_path)
     w = _worker(tmp_path)
-    w.cfg.ai_dry_run = False  # 讓自動駕駛的暫停邏輯生效（測試中不會真的送出：沒有視窗）
+    # 自動駕駛模式（測試中不會真的送出：沒有視窗）
     pw = ProjectWindow(1, "kiro", "Kiro", "t", "proj", "", str(path), False, False)
     judge = FakeJudge(verify_ok=True)  # 模型說通過，但有確定的問題，仍不能算通過
     sess = w._session_for(pw)
 
     def setup(st):
-        st.goal, st.acceptance_confirmed_at, st.autopilot = "G", now_str(), True
+        st.goal, st.acceptance_confirmed_at = "G", now_str()
         st.acceptance = [{"text": "A", "status": "todo"}]
     sess.update(setup)
+    w.cfg.set_mode(pw.key, "auto")
     stopped = {"agent_state": "waiting_input", "summary": "停"}
-    w._send_disabled = True
     for attempt in range(1, 4):
         report = os.path.join(sess.reports_dir, f"r{attempt}.md")
         os.makedirs(sess.reports_dir, exist_ok=True)

@@ -7,6 +7,7 @@ DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 
 # 運作模式：image = 截圖比對點擊（會動滑鼠）；uia = UIA 按鈕點擊（不動滑鼠）；ai = AI 代理（視覺模型 + Decision-1）
 MODES = ("image", "uia", "ai")
+SESSION_MODES = ("off", "suggest", "auto")
 
 
 def _default_targets() -> List[Dict[str, Any]]:
@@ -71,6 +72,8 @@ class AppConfig:
     basic_mode: str = "uia"
     # 使用者勾選、允許助理操作的工作階段（projects.session_key 的值）。新偵測到的視窗預設不勾選
     authorized_sessions: List[str] = field(default_factory=list)
+    # 每個工作階段的模式：off = 關閉、suggest = 只建議、auto = 自動駕駛。這是唯一的開關，authorized_sessions 跟著同步
+    session_modes: Dict[str, str] = field(default_factory=dict)
     # 截圖比對模式
     scan_interval: float = 1.0
     threshold: float = 0.85
@@ -137,6 +140,8 @@ class AppConfig:
                     val = float(raw)
                 elif isinstance(default_val, list):
                     val = list(raw)
+                elif isinstance(default_val, dict):
+                    val = dict(raw)
                 else:
                     val = str(raw)
             except (TypeError, ValueError):
@@ -154,6 +159,18 @@ class AppConfig:
 
     def is_authorized(self, key: str) -> bool:
         return key in self.authorized_sessions
+
+    def mode_of(self, key: str) -> str:
+        m = self.session_modes.get(key)
+        if m in SESSION_MODES:
+            return m
+        return "suggest" if key in self.authorized_sessions else "off"
+
+    def set_mode(self, key: str, mode: str) -> None:
+        if mode not in SESSION_MODES:
+            mode = "off"
+        self.session_modes[key] = mode
+        self.set_authorized(key, mode != "off")
 
     def set_authorized(self, key: str, allowed: bool) -> None:
         if allowed and key not in self.authorized_sessions:

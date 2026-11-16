@@ -4,7 +4,7 @@ import re
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import List, Dict, Any, Tuple
 
 import cv2
@@ -15,7 +15,7 @@ from ai_client import AIError
 from ai_settings import AISettings, DEFAULT_SECRETS_PATH
 from automation import AutomationWorker, make_clients
 from config import AppConfig, DEFAULT_CONFIG_PATH
-from projects import ProjectDetector, ProjectWindow
+from projects import ProjectDetector, ProjectWindow, contains_assistant
 from driver import build_docs_question, build_goal_question, doc_candidates
 from sessions import now_str, phase_label, phase_of, read_kiro_specs, read_plans
 from uia_driver import name_in as ud_name_in
@@ -34,6 +34,9 @@ FONT_B = ("Microsoft JhengHei UI", 9, "bold")
 FONT_S = ("Microsoft JhengHei UI", 8)
 
 APP_NAME = "AI 工程助理"
+
+MODE_TEXT = {"off": "關閉", "suggest": "只建議", "auto": "自動駕駛"}
+MODE_COLOR = {"off": "#64748B", "suggest": "#38BDF8", "auto": "#34D399"}
 
 MODE_LABELS = {
     "image": "基本按鈕精靈・圖片比對",
@@ -91,9 +94,12 @@ class FloatingOverlayApp:
         self._drag_offset = (0, 0)
         self._thumb_refs: List[ImageTk.PhotoImage] = []
 
+        self._migrate_session_modes()  # 要在建立畫面前完成，選單才會顯示正確的模式
         self._setup_window()
         self._build_ui()
         self._reload_scanner_and_borders()
+        if self.cfg.mode in ("ai", "uia"):
+            self.toggle_running()  # 開啟就開始運作；每個視窗的模式決定它會做什麼
         self._schedule_loops()
 
     # ------------------------------------------------------------------ 視窗與版面
@@ -237,7 +243,7 @@ class FloatingOverlayApp:
     def _build_sessions_tab(self, parent: tk.Frame) -> None:
         head = tk.Frame(parent, bg=BG)
         head.pack(fill="x")
-        _label(head, "只有勾選的視窗會被點擊或輸入（Kiro / Antigravity）", fg=FG_DIM, font=FONT_S).pack(side="left")
+        _label(head, "每個視窗選一個模式：關閉／只建議／自動駕駛", fg=FG_DIM, font=FONT_S).pack(side="left")
         _button(head, "↻", self._refresh_sessions).pack(side="right")
         self.sessions_frame = tk.Frame(parent, bg=BG2, pady=2)
         self.sessions_frame.pack(fill="x", pady=(4, 6))
@@ -246,6 +252,7 @@ class FloatingOverlayApp:
         self._session_status_lbls: Dict[str, tk.Label] = {}
         self._last_session_refresh = 0.0
         self._dialogs: Dict[str, "SessionDialog"] = {}
+        self._mode_boxes: Dict[str, ttk.Combobox] = {}
 
         hum = tk.LabelFrame(parent, text=" 🙋 需要你決定（輪巡時跳過） ", bg=BG, fg="#FBBF24", font=FONT_B, padx=6, pady=4)
         hum.pack(fill="both", expand=True)
@@ -276,6 +283,7 @@ class FloatingOverlayApp:
         for c in self.sessions_frame.winfo_children():
             c.destroy()
         self._session_status_lbls.clear()
+        self._mode_boxes = {}
         if not groups:
             tk.Label(self.sessions_frame, text="沒有偵測到開著專案的 Kiro / Antigravity 視窗", bg=BG2, fg=FG_DIM,
                      font=FONT_S, pady=6).pack(fill="x")
@@ -285,13 +293,17 @@ class FloatingOverlayApp:
             row.pack(fill="x", padx=4, pady=1)
             top = tk.Frame(row, bg=BG2)
             top.pack(fill="x")
-            var = tk.BooleanVar(value=self.cfg.is_authorized(key))
             more = f"（{len(g)} 個視窗）" if len(g) > 1 else ""
-            tk.Checkbutton(top, text=f"{w.app_label}｜{w.project}{more}", variable=var, bg=BG2, fg="#F8FAFC",
-                           selectcolor=BG, activebackground=BG2, font=FONT_B,
-                           command=lambda k=key, v=var: self._toggle_session(k, v.get())).pack(side="left")
+            self_mark = "　🛡 助理本身" if contains_assistant(w.path, w.remote) else ""
+            tk.Label(top, text=f"{w.app_label}｜{w.project}{more}{self_mark}", bg=BG2, fg="#F8FAFC",
+                     font=FONT_B).pack(side="left")
             _button(top, "前往", lambda h=w.hwnd: wu.activate_window(h)).pack(side="right")
-            _button(top, "目標／建議", lambda pw=w: self._open_session_dialog(pw), bg="#7C3AED").pack(side="right", padx=4)
+            _button(top, "詳情", lambda pw=w: self._open_session_dialog(pw), bg="#7C3AED").pack(side="right", padx=4)
+            mode_cb = ttk.Combobox(top, values=list(MODE_TEXT.values()), state="readonly", width=8, font=FONT_S)
+            mode_cb.set(MODE_TEXT[self.cfg.mode_of(key)])
+            mode_cb.pack(side="right", padx=2)
+            mode_cb.bind("<<ComboboxSelected>>", lambda _e, k=key, cb=mode_cb, pw=w: self._on_session_mode(k, cb, pw))
+            self._mode_boxes[key] = mode_cb
             loc = w.location + ("　⚠ 同名專案有多個路徑，已取最近開啟的" if w.ambiguous else "")
             if w.remote:
                 loc += "　⚠ 遠端，無法在本機查核證據"
@@ -307,12 +319,16 @@ class FloatingOverlayApp:
 
     def _update_session_status_labels(self) -> None:
         for key, lbl in self._session_status_lbls.items():
-            if not self.cfg.is_authorized(key):
-                lbl.configure(text="未勾選：助理不會操作這個視窗", fg="#64748B")
+            mode = self.cfg.mode_of(key)
+            if mode == "off":
+                lbl.configure(text="關閉：助理不會看也不會操作這個視窗", fg=MODE_COLOR["off"])
+            elif not self.is_running:
+                lbl.configure(text="⏸ 已全部暫停（按上方按鈕或 F8 繼續）", fg="#FBBF24")
             elif getattr(self, "_session_iconic", {}).get(key):
-                lbl.configure(text="🗕 視窗最小化：無法截圖觀察，還原視窗後才會繼續", fg="#FBBF24")
+                lbl.configure(text="🗕 視窗最小化：無法觀察，還原視窗後才會繼續", fg="#FBBF24")
             else:
-                lbl.configure(text=self.session_status.get(key, "已勾選：等待啟動或下一輪輪巡"), fg="#38BDF8")
+                default = "自動駕駛：下一輪觀察後就會動作" if mode == "auto" else "只建議：會寫出建議，送出要你按"
+                lbl.configure(text=self.session_status.get(key, default), fg=MODE_COLOR[mode])
 
     def _open_session_dialog(self, pw: ProjectWindow) -> None:
         old = self._dialogs.get(pw.key)
@@ -322,11 +338,38 @@ class FloatingOverlayApp:
             return
         self._dialogs[pw.key] = SessionDialog(self, pw)
 
-    def _toggle_session(self, key: str, allowed: bool) -> None:
-        self.cfg.set_authorized(key, allowed)
+    def _on_session_mode(self, key: str, cb: ttk.Combobox, pw: ProjectWindow) -> None:
+        mode = {v: k for k, v in MODE_TEXT.items()}.get(cb.get(), "off")
+        if mode == "auto" and contains_assistant(pw.path, pw.remote):
+            ok = messagebox.askyesno(
+                "確認", "這個視窗開的是 AI 工程助理自己的專案。\n\n如果你在這個視窗的對話裡調整助理，"
+                "自動駕駛會替你代按確認、打字進同一個對話，造成干擾。\n\n確定要開自動駕駛嗎？", parent=self.root)
+            if not ok:
+                cb.set(MODE_TEXT[self.cfg.mode_of(key)])
+                return
+        self.set_session_mode(key, mode)
+        if mode == "auto":
+            st = self.worker.store.get(pw.key, pw.app_label, pw.project, pw.path, pw.remote).load()
+            if not st.goal:
+                self._open_session_dialog(pw)  # 還沒有目標：打開詳情讓你直接輸入
+
+    def set_session_mode(self, key: str, mode: str) -> None:
+        self.cfg.set_mode(key, mode)
         self.cfg.save(self.config_path)
-        self._append_log(f"{'☑ 允許' if allowed else '☐ 取消'}操作：{key}")
+        if mode == "auto":
+            for s in self.worker.store.all():
+                st = s.load()
+                if st.key == key and st.paused_reason:
+                    s.update(lambda x: setattr(x, "paused_reason", ""))
+        cb = self._mode_boxes.get(key)
+        if cb is not None and cb.winfo_exists():
+            cb.set(MODE_TEXT[mode])
+        self._append_log(f"模式 → {MODE_TEXT[mode]}：{key}")
         self._update_session_status_labels()
+        self._update_status_idle()
+        dlg = self._dialogs.get(key)
+        if dlg is not None and dlg.win.winfo_exists():
+            dlg.reload()
 
     # ------------------------------------------------------------------ 分頁：退回基本按鈕精靈
     def _build_basic_tab(self, parent: tk.Frame) -> None:
@@ -377,8 +420,8 @@ class FloatingOverlayApp:
 
     # ------------------------------------------------------------------ 分頁：AI 代理
     def _build_ai_tab(self, parent: tk.Frame) -> None:
-        self.dry_run_var = tk.BooleanVar(value=self.cfg.ai_dry_run)
-        _check(parent, "觀察模式：只記錄 AI 打算做什麼，不實際點擊或輸入", self.dry_run_var, self._save_ai_settings).pack(anchor="w")
+        _label(parent, "要不要自動動作，在「工作階段」分頁每個視窗的模式選單設定（關閉／只建議／自動駕駛）。", fg=FG_DIM,
+               font=FONT_S, wraplength=370, justify="left").pack(anchor="w")
         self.allow_reply_var = tk.BooleanVar(value=self.cfg.ai_allow_reply)
         _check(parent, "允許 AI 理解問題後自行回覆（不只是「繼續」）", self.allow_reply_var, self._save_ai_settings).pack(anchor="w")
         self.auto_choose_var = tk.BooleanVar(value=self.cfg.ai_auto_choose)
@@ -430,7 +473,6 @@ class FloatingOverlayApp:
 
     def _save_ai_settings(self) -> None:
         c = self.cfg
-        c.ai_dry_run = bool(self.dry_run_var.get())
         c.ai_allow_reply = bool(self.allow_reply_var.get())
         c.ai_auto_choose = bool(self.auto_choose_var.get())
         c.driver_enabled = bool(self.driver_var.get())
@@ -597,6 +639,25 @@ class FloatingOverlayApp:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    def _migrate_session_modes(self) -> None:
+        """舊設定（勾選＋詳情裡的自動駕駛開關）轉成新的單一模式；助理自己的專案一律從「關閉」開始。"""
+        changed = False
+        for key in list(self.cfg.authorized_sessions):
+            if key in self.cfg.session_modes:
+                continue
+            mode = "suggest"
+            for s in self.worker.store.all():
+                st = s.load()
+                if st.key == key:
+                    if contains_assistant(st.path, st.remote):
+                        mode = "off"
+                    elif st.autopilot:
+                        mode = "auto"
+            self.cfg.set_mode(key, mode)
+            changed = True
+        if changed:
+            self.cfg.save(self.config_path)
+
     # ------------------------------------------------------------------ 共用小工具
     @staticmethod
     def _open_path(path: str) -> None:
@@ -641,12 +702,15 @@ class FloatingOverlayApp:
             self.worker.running.clear()
 
     def _update_status_idle(self) -> None:
-        n = len(self.cfg.authorized_sessions)
-        scope = f"勾選 {n} 個" if self.cfg.mode in ("uia", "ai") else "全螢幕/區域"
-        if self.is_running:
-            self.status_lbl.configure(text=f"🟢 {MODE_LABELS[self.cfg.mode]}｜{scope}｜累計 {self.click_count} 次", fg="#34D399")
+        if self.cfg.mode == "ai":
+            modes = [self.cfg.mode_of(k) for k in self.cfg.authorized_sessions]
+            scope = f"自動駕駛 {modes.count('auto')}、只建議 {modes.count('suggest')}"
         else:
-            self.status_lbl.configure(text=f"待機中｜{MODE_LABELS[self.cfg.mode]}｜累計 {self.click_count} 次", fg="#CBD5E1")
+            scope = "基本按鈕精靈・" + ("UIA 按鈕" if self.cfg.mode == "uia" else "圖片比對")
+        if self.is_running:
+            self.status_lbl.configure(text=f"🟢 運作中｜{scope}｜累計 {self.click_count} 次", fg="#34D399")
+        else:
+            self.status_lbl.configure(text=f"⏸ 已暫停｜{scope}｜累計 {self.click_count} 次", fg="#FBBF24")
 
     # ------------------------------------------------------------------ 圖片比對模式（原有）
     def _refresh_regions_ui(self) -> None:
@@ -805,12 +869,14 @@ class FloatingOverlayApp:
     def toggle_running(self) -> None:
         self.is_running = not self.is_running
         if self.is_running:
-            self.toggle_btn.configure(text="⏸ 停止 (F8)", bg="#EF4444", activebackground="#DC2626")
+            self.toggle_btn.configure(text="⏸ 全部暫停 (F8)", bg="#475569", activebackground="#334155")
             self.last_scan_time = 0.0
         else:
-            self.toggle_btn.configure(text="▶ 啟動 (F8)", bg="#10B981", activebackground="#059669")
+            self.toggle_btn.configure(text="▶ 繼續 (F8)", bg="#10B981", activebackground="#059669")
         self._sync_worker()
         self._update_status_idle()
+        if hasattr(self, "_session_status_lbls"):
+            self._update_session_status_labels()
 
     def _get_self_rect(self) -> Tuple[int, int, int, int]:
         return (self.root.winfo_rootx(), self.root.winfo_rooty(), self.root.winfo_width(), self.root.winfo_height())
@@ -839,6 +905,12 @@ class FloatingOverlayApp:
                 dlg = self._dialogs.get(ev["key"])
                 if dlg is not None and dlg.win.winfo_exists():
                     dlg.reload(full=False)
+            elif kind == "modes_changed":
+                for key, cb in self._mode_boxes.items():
+                    if cb.winfo_exists():
+                        cb.set(MODE_TEXT[self.cfg.mode_of(key)])
+                self._update_session_status_labels()
+                self._update_status_idle()
             elif kind == "send_result":
                 dlg = self._dialogs.get(ev["key"])
                 if dlg is not None and dlg.win.winfo_exists():
@@ -938,8 +1010,7 @@ class SessionDialog:
 
         _label(body, f"{pw.app_label}｜{pw.project}", font=("Microsoft JhengHei UI", 11, "bold")).pack(anchor="w")
         _label(body, pw.location, fg=FG_DIM, font=("Consolas", 8), wraplength=430, justify="left").pack(anchor="w")
-        if not app.cfg.is_authorized(pw.key):
-            _label(body, "⚠ 這個工作階段沒有勾選，助理不會操作它（送出也會被擋下）", fg="#FBBF24", font=FONT_S).pack(anchor="w")
+
 
         gbox = tk.LabelFrame(body, text=" 🎯 目標（由你訂定） ", bg=BG, fg="#34D399", font=FONT_B, padx=6, pady=4)
         gbox.pack(fill="x", pady=(6, 4))
@@ -960,9 +1031,10 @@ class SessionDialog:
         prow.pack(fill="x")
         self.phase_lbl = _label(prow, "", font=FONT_B)
         self.phase_lbl.pack(side="left")
-        self.autopilot_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(prow, text="自動駕駛", variable=self.autopilot_var, command=self.toggle_autopilot, bg=BG,
-                       fg="#F8FAFC", selectcolor=BG2, activebackground=BG, font=FONT_B).pack(side="right")
+        self.mode_cb = ttk.Combobox(prow, values=list(MODE_TEXT.values()), state="readonly", width=8, font=FONT_S)
+        self.mode_cb.pack(side="right")
+        self.mode_cb.bind("<<ComboboxSelected>>", lambda _e: self.app._on_session_mode(self.pw.key, self.mode_cb, self.pw))
+        _label(prow, "模式", font=FONT_S).pack(side="right", padx=4)
         self.ap_info = _label(self.p2_box, "", fg=FG_DIM, font=FONT_S, wraplength=420, justify="left")
         self.ap_info.pack(anchor="w")
         self.pause_row = tk.Frame(self.p2_box, bg=BG)
@@ -1077,15 +1149,18 @@ class SessionDialog:
     def _fill_p2(self, st) -> None:
         phase = phase_of(st)
         self.phase_lbl.configure(text=f"階段：{phase_label(st)}")
-        self.autopilot_var.set(st.autopilot)
+        mode = self.app.cfg.mode_of(self.pw.key)
+        self.mode_cb.set(MODE_TEXT[mode])
         notes = []
-        if self.app.cfg.ai_dry_run:
-            notes.append("⚠ 「AI 設定」的全域觀察模式開著：自動駕駛不會實際動作，只寫建議")
-        if st.autopilot:
+        if mode == "off":
+            notes.append("模式是「關閉」：助理不會看也不會操作這個視窗")
+        if not self.app.is_running:
+            notes.append("⏸ 已全部暫停：按主畫面上方的按鈕或 F8 繼續")
+        if mode == "auto":
             notes.append(f"自動駕駛開著：代理停下來且你閒置 {self.app.cfg.ai_idle_sec:.0f} 秒後自動送出建議，"
                          f"每小時最多 {int(self.app.cfg.autopilot_max_per_hour)} 次；Allow 依危險規則與風險門檻代按")
-        else:
-            notes.append("自動駕駛關著：只寫建議，送出要你按")
+        elif mode == "suggest":
+            notes.append("只建議：助理寫出建議的訊息，送出要你按下方按鈕")
         if phase == "spec" and st.acceptance and not st.acceptance_confirmed_at:
             notes.append("驗收 spec 草稿已出來：確認後才會開始實作")
         self.ap_info.configure(text="\n".join(notes))
@@ -1103,24 +1178,6 @@ class SessionDialog:
         can_confirm = bool(st.acceptance) and not st.acceptance_confirmed_at
         self.confirm_btn.configure(state="normal" if can_confirm else "disabled")
         self.rollover_btn.configure(state="normal" if st.goal else "disabled")
-
-    def toggle_autopilot(self) -> None:
-        on = bool(self.autopilot_var.get())
-        if on and not self.app.cfg.is_authorized(self.pw.key):
-            self.autopilot_var.set(False)
-            self.result_lbl.configure(text="這個工作階段沒有勾選，不能開自動駕駛。", fg="#F87171")
-            return
-
-        def mutate(st) -> None:
-            st.autopilot = on
-            if on:
-                st.paused_reason = ""
-            st.add_interaction("autopilot", "開" if on else "關")
-
-        self.sess.update(mutate)
-        self.sess.history("autopilot", on=on, by="user")
-        self.result_lbl.configure(text="自動駕駛已開啟。" if on else "自動駕駛已關閉。", fg="#34D399" if on else FG_DIM)
-        self.reload()
 
     def resume_autopilot(self) -> None:
         def mutate(st) -> None:
