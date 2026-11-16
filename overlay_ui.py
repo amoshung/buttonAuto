@@ -36,7 +36,8 @@ FONT_S = ("Microsoft JhengHei UI", 8)
 APP_NAME = "AI 工程助理"
 
 MODE_TEXT = {"off": "關閉", "suggest": "只建議", "auto": "自動駕駛"}
-MODE_COLOR = {"off": "#64748B", "suggest": "#38BDF8", "auto": "#34D399"}
+MODE_COLOR = {"off": "#64748B", "suggest": "#38BDF8", "auto": "#22C55E"}
+MODE_ROW_BG = {"off": "#111827", "suggest": "#0C2233", "auto": "#0B2A1B"}
 
 MODE_LABELS = {
     "image": "基本按鈕精靈・圖片比對",
@@ -275,7 +276,8 @@ class FloatingOverlayApp:
             else:
                 no_project.append(w)
         self._session_iconic = {k: all(x.iconic for x in g) for k, g in groups.items()}
-        sig = tuple(sorted((k, g[0].project, g[0].location, g[0].ambiguous, len(g)) for k, g in groups.items())) + (len(no_project),)
+        sig = tuple(sorted((k, g[0].project, g[0].location, g[0].ambiguous, len(g), self.cfg.mode_of(k))
+                           for k, g in groups.items())) + (len(no_project),)
         if sig == self._session_sig:
             self._update_session_status_labels()
             return
@@ -287,16 +289,28 @@ class FloatingOverlayApp:
         if not groups:
             tk.Label(self.sessions_frame, text="沒有偵測到開著專案的 Kiro / Antigravity 視窗", bg=BG2, fg=FG_DIM,
                      font=FONT_S, pady=6).pack(fill="x")
-        for key, g in sorted(groups.items(), key=lambda kv: (kv[1][0].app, kv[1][0].project.lower())):
+        order = {"auto": 0, "suggest": 1, "off": 2}
+        current = None
+        for key, g in sorted(groups.items(), key=lambda kv: (order[self.cfg.mode_of(kv[0])], kv[1][0].app,
+                                                              kv[1][0].project.lower())):
             w = g[0]
-            row = tk.Frame(self.sessions_frame, bg=BG2, pady=2)
-            row.pack(fill="x", padx=4, pady=1)
-            top = tk.Frame(row, bg=BG2)
+            mode = self.cfg.mode_of(key)
+            if mode != current:
+                current = mode
+                n = sum(1 for k in groups if self.cfg.mode_of(k) == mode)
+                tk.Label(self.sessions_frame, text=f"● {MODE_TEXT[mode]}（{n}）", bg=BG2, fg=MODE_COLOR[mode],
+                         font=FONT_B, anchor="w").pack(fill="x", padx=6, pady=(6, 0))
+            row_bg = MODE_ROW_BG[mode]
+            outer = tk.Frame(self.sessions_frame, bg=MODE_COLOR[mode])
+            outer.pack(fill="x", padx=4, pady=1)
+            row = tk.Frame(outer, bg=row_bg, pady=2)
+            row.pack(fill="x", padx=(4, 0))  # 左側 4px 色條
+            top = tk.Frame(row, bg=row_bg)
             top.pack(fill="x")
             more = f"（{len(g)} 個視窗）" if len(g) > 1 else ""
             self_mark = "　🛡 助理本身" if contains_assistant(w.path, w.remote) else ""
-            tk.Label(top, text=f"{w.app_label}｜{w.project}{more}{self_mark}", bg=BG2, fg="#F8FAFC",
-                     font=FONT_B).pack(side="left")
+            tk.Label(top, text=f"{w.app_label}｜{w.project}{more}{self_mark}", bg=row_bg,
+                     fg="#F8FAFC" if mode != "off" else "#94A3B8", font=FONT_B).pack(side="left")
             _button(top, "前往", lambda h=w.hwnd: wu.activate_window(h)).pack(side="right")
             _button(top, "詳情", lambda pw=w: self._open_session_dialog(pw), bg="#7C3AED").pack(side="right", padx=4)
             mode_cb = ttk.Combobox(top, values=list(MODE_TEXT.values()), state="readonly", width=8, font=FONT_S)
@@ -304,13 +318,16 @@ class FloatingOverlayApp:
             mode_cb.pack(side="right", padx=2)
             mode_cb.bind("<<ComboboxSelected>>", lambda _e, k=key, cb=mode_cb, pw=w: self._on_session_mode(k, cb, pw))
             self._mode_boxes[key] = mode_cb
+            if mode == "off":
+                continue  # 關閉的視窗只顯示一行，清單才放得下
             loc = w.location + ("　⚠ 同名專案有多個路徑，已取最近開啟的" if w.ambiguous else "")
             if w.remote:
                 loc += "　⚠ 遠端，無法在本機查核證據"
-            tk.Label(row, text=loc, bg=BG2, fg=FG_DIM, font=("Consolas", 8), anchor="w", justify="left",
-                     wraplength=330).pack(fill="x", padx=22)
-            st = tk.Label(row, text="", bg=BG2, fg="#38BDF8", font=FONT_S, anchor="w", wraplength=340, justify="left")
-            st.pack(fill="x", padx=22)
+            tk.Label(row, text=loc, bg=row_bg, fg=FG_DIM, font=("Consolas", 8), anchor="w", justify="left",
+                     wraplength=330).pack(fill="x", padx=18)
+            st = tk.Label(row, text="", bg=row_bg, fg=MODE_COLOR[mode], font=FONT_S, anchor="w", wraplength=340,
+                          justify="left")
+            st.pack(fill="x", padx=18)
             self._session_status_lbls[key] = st
         if no_project:
             tk.Label(self.sessions_frame, text=f"另有 {len(no_project)} 個視窗沒開專案（例如歡迎頁），不會被操作",
@@ -361,10 +378,9 @@ class FloatingOverlayApp:
                 st = s.load()
                 if st.key == key and st.paused_reason:
                     s.update(lambda x: setattr(x, "paused_reason", ""))
-        cb = self._mode_boxes.get(key)
-        if cb is not None and cb.winfo_exists():
-            cb.set(MODE_TEXT[mode])
         self._append_log(f"模式 → {MODE_TEXT[mode]}：{key}")
+        self._session_sig = ()
+        self.root.after(10, self._refresh_sessions)  # 依模式重新排序與上色
         self._update_session_status_labels()
         self._update_status_idle()
         dlg = self._dialogs.get(key)
@@ -907,10 +923,8 @@ class FloatingOverlayApp:
                 if dlg is not None and dlg.win.winfo_exists():
                     dlg.reload(full=False)
             elif kind == "modes_changed":
-                for key, cb in self._mode_boxes.items():
-                    if cb.winfo_exists():
-                        cb.set(MODE_TEXT[self.cfg.mode_of(key)])
-                self._update_session_status_labels()
+                self._session_sig = ()
+                self._refresh_sessions()
                 self._update_status_idle()
             elif kind == "send_result":
                 dlg = self._dialogs.get(ev["key"])
