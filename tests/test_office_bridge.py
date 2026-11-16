@@ -73,28 +73,46 @@ def test_snapshot_maps_sessions_to_office_workers(env):
     by = {w["id"]: w for w in snap["workers"]}
     assert set(by) == {KIRO, AG, SELF}  # 只列出開著的視窗
     k = by[KIRO]
-    assert k["status"] == "needs_help" and k["mode"] == "auto" and k["category"] == "ide"
+    # 自動駕駛：等允許由助理判斷，不算「需要你」，但網頁上仍可以自己按
+    assert k["status"] == "paused" and not k["needsYou"] and k["mode"] == "auto" and k["category"] == "ide"
     assert k["quickActions"][:3] == ["Yes, allow this time", "Yes, and always allow 'Get-ChildItem'", "Skip"]
-    assert ACT_NEW_CHAT in k["quickActions"] and "Get-ChildItem" in k["helpPrompt"]
+    assert ACT_NEW_CHAT in k["quickActions"] and "Get-ChildItem" in k["approvalCommand"]
     assert (k["verified"], k["core"], k["hourSends"]) == (1, 2, 1)
     assert k["logs"] and k["logs"][0]["timestamp"].count(":") >= 2
     assert by[AG]["status"] == "working" and by[AG]["activity"] == "實作 U2"
-    assert by[SELF]["status"] == "paused" and by[SELF]["modeLocked"] and by[SELF]["quickActions"] == []
+    assert by[SELF]["status"] == "idle" and by[SELF]["modeLocked"] and by[SELF]["quickActions"] == []  # 關閉→茶水間
+    assert by[SELF]["statusLabel"].startswith("關閉") and by[KIRO]["statusLabel"].startswith("等允許")
+    assert by[KIRO]["deskId"] in ("desk-1", "desk-2", "desk-3", "desk-4")  # 自動駕駛區
+    assert by[AG]["deskId"] in ("desk-5", "desk-6", "desk-7", "desk-8")  # 只建議區
+    assert by[KIRO]["acceptance"][0] == {"text": "匯出", "status": "verified", "manual": False, "checked": False}
     desks = [w["deskId"] for w in snap["workers"]]
     assert len(set(desks)) == 3  # 每人一個座位
-    assert snap["workers"][0]["id"] == KIRO  # 需要你的排最前面
+    assert snap["workers"][0]["id"] == KIRO  # 自動駕駛排最前面（沒有人需要你時）
     assert env.bridge.snapshot()["workers"][0]["deskId"] == by[KIRO]["deskId"]  # 座位不會換
 
 
 def test_worker_status_rules():
+    from office_bridge import status_label
     st = SessionState(goal="G", agent_state="idle", acceptance_confirmed_at="x", done_at="x")
-    assert worker_status(st, "auto") == "idle"
+    assert worker_status(st, "auto") == "paused" and status_label(st, "auto") == "目標已達成"
     st = SessionState(goal="G", agent_state="working", suggested_prompt="繼續")
     assert worker_status(st, "suggest") == "needs_help"  # 只建議：等你按送出
     assert worker_status(st, "auto") == "working"
-    assert worker_status(st, "off") == "paused"
+    assert worker_status(st, "off") == "idle"  # 關閉：去茶水間
     st = SessionState(pending_human=["目標已達成，請你驗收"], agent_state="done")
-    assert worker_status(st, "auto") == "idle"  # 達成的提醒不算「需要你」
+    assert worker_status(st, "auto") == "paused"  # 達成的提醒不算「需要你」
+    st = SessionState(goal="G", paused_reason="連續 3 次要不到合格的證據", pending_human=["連續 3 次要不到合格的證據"])
+    assert status_label(st, "auto") == "自動駕駛已暫停" and worker_status(st, "auto") == "needs_help"
+
+
+def test_resume_autopilot_from_web(env):
+    from office_bridge import ACT_RESUME
+    env.a.update(lambda st: (setattr(st, "paused_reason", "卡住"), st.pending_human.append("卡住")))
+    snap = {w["id"]: w for w in env.bridge.snapshot()["workers"]}
+    assert ACT_RESUME in snap[KIRO]["quickActions"]
+    assert env.bridge.assist(KIRO, ACT_RESUME, "")["ok"] is True
+    st = env.a.load()
+    assert st.paused_reason == "" and "卡住" not in st.pending_human
 
 
 def test_assist_only_accepts_listed_actions(env):
@@ -148,3 +166,16 @@ def test_http_endpoints_require_token_and_return_snapshot(env):
         assert json.loads(data)["ok"] is True and env.worker.calls[-1] == ("click", KIRO, "Skip")
     finally:
         d.stop()
+
+
+def test_cancel_is_never_offered_on_the_web(env):
+    env.a.update(lambda st: st.approval_buttons.append("Cancel"))
+    k = {w["id"]: w for w in env.bridge.snapshot()["workers"]}[KIRO]
+    assert "Cancel" not in k["quickActions"]
+    assert env.bridge.assist(KIRO, "Cancel", "")["ok"] is False
+
+
+def test_suggest_mode_approval_needs_you(env):
+    env.cfg.set_mode(KIRO, "suggest")
+    k = {w["id"]: w for w in env.bridge.snapshot()["workers"]}[KIRO]
+    assert k["needsYou"] and k["status"] == "needs_help" and k["statusLabel"] == "等你允許"

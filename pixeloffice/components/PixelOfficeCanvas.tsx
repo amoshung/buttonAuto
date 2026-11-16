@@ -32,6 +32,7 @@ interface PixelOfficeCanvasProps {
   needsHelpCount: number;
   soundMuted: boolean;
   onToggleSound: () => void;
+  className?: string;
 }
 
 const WORLD_W = MAP_COLS * TILE_SIZE;
@@ -39,10 +40,10 @@ const WORLD_H = MAP_ROWS * TILE_SIZE;
 
 const STATUS_LABEL: Record<AgentWorker['status'], string> = {
   working: '工作中',
-  needs_help: '需要協助',
-  idle: '待機休息',
-  paused: '已暫停',
-  error: '發生異常',
+  needs_help: '需要你',
+  idle: '休息中',
+  paused: '待命',
+  error: '出錯',
 };
 
 export default function PixelOfficeCanvas({
@@ -53,16 +54,19 @@ export default function PixelOfficeCanvas({
   needsHelpCount,
   soundMuted,
   onToggleSound,
+  className = '',
 }: PixelOfficeCanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Decoupled mutable simulation refs for 60fps loop without React re-render overhead
-  const simWorkersRef = useRef<AgentWorker[]>(workers);
+  // 一開始是空的：第一批資料進來時每個人都會依狀態規劃路線（關閉的走去茶水間）
+  const simWorkersRef = useRef<AgentWorker[]>([]);
   const selectedIdRef = useRef<string | null>(selectedWorkerId);
   const hoveredIdRef = useRef<string | null>(null);
   const showLabelsRef = useRef<boolean>(true);
-  const cameraRef = useRef({ zoom: 2.2, panX: 0, panY: 0, initialized: false });
+  // userAdjusted：使用者自己縮放或拖曳過，視窗大小改變時就不自動重新置中
+  const cameraRef = useRef({ zoom: 2.2, panX: 0, panY: 0, initialized: false, userAdjusted: false });
   const dragRef = useRef<{
     active: boolean;
     moved: boolean;
@@ -131,12 +135,13 @@ export default function PixelOfficeCanvas({
 
   const fitCameraToViewport = (w: number, h: number) => {
     if (w <= 0 || h <= 0) return;
-    const fitZoom = Math.min((w - 24) / WORLD_W, (h - 24) / WORLD_H);
-    const clampedZoom = Math.max(1.2, Math.min(3.0, Math.floor(fitZoom * 10) / 10));
+    const fitZoom = Math.min((w - 16) / WORLD_W, (h - 16) / WORLD_H);
+    const clampedZoom = Math.max(0.6, Math.min(3.0, Math.floor(fitZoom * 10) / 10));
     cameraRef.current.zoom = clampedZoom;
     cameraRef.current.panX = Math.round((w - WORLD_W * clampedZoom) / 2);
     cameraRef.current.panY = Math.round((h - WORLD_H * clampedZoom) / 2);
     cameraRef.current.initialized = true;
+    cameraRef.current.userAdjusted = false;
     setZoomPct(Math.round(clampedZoom * 100));
   };
 
@@ -145,8 +150,9 @@ export default function PixelOfficeCanvas({
     if (!el) return;
     const rect = el.getBoundingClientRect();
     const prevZoom = cameraRef.current.zoom;
-    const nextZoom = Math.max(1.0, Math.min(3.5, Math.round((prevZoom + delta) * 4) / 4));
+    const nextZoom = Math.max(0.5, Math.min(3.5, Math.round((prevZoom + delta) * 4) / 4));
     if (nextZoom === prevZoom) return;
+    cameraRef.current.userAdjusted = true;
 
     const cx = rect.width / 2;
     const cy = rect.height / 2;
@@ -215,7 +221,8 @@ export default function PixelOfficeCanvas({
       canvas.height = Math.max(1, Math.floor(rect.height * dpr));
       canvas.style.width = `${rect.width}px`;
       canvas.style.height = `${rect.height}px`;
-      if (!cameraRef.current.initialized) {
+      // 第一次、或使用者沒有自己調整過：跟著視窗大小重新縮放置中（縮小瀏覽器時整個辦公室仍看得到）
+      if (!cameraRef.current.initialized || !cameraRef.current.userAdjusted) {
         fitCameraToViewport(rect.width, rect.height);
       }
     };
@@ -338,6 +345,7 @@ export default function PixelOfficeCanvas({
       const dy = e.clientY - dragRef.current.startY;
       if (Math.hypot(dx, dy) > 5) {
         dragRef.current.moved = true;
+        cameraRef.current.userAdjusted = true;
         cameraRef.current.panX = dragRef.current.origPanX + dx;
         cameraRef.current.panY = dragRef.current.origPanY + dy;
         setHoveredWorker(null);
@@ -382,7 +390,7 @@ export default function PixelOfficeCanvas({
   return (
     <div
       ref={containerRef}
-      className="relative flex-1 h-full min-h-[420px] bg-[#0e1017] overflow-hidden select-none"
+      className={`relative bg-[#0e1017] overflow-hidden select-none ${className}`}
       data-testid="pixel-office-viewport"
     >
       <canvas
@@ -413,12 +421,12 @@ export default function PixelOfficeCanvas({
             >
               <AlertTriangle className="w-4 h-4" aria-hidden="true" />
               <span className="tabular-nums">
-                {needsHelpCount} 位夥伴需要協助 · 前往處理 [N]
+                {needsHelpCount} 位需要你<span className="hidden sm:inline"> · 前往處理 [N]</span>
               </span>
             </button>
           ) : (
             <div className="px-3 py-1.5 rounded-lg bg-[#161a26] border border-[#2a3044] text-xs text-emerald-400 font-medium">
-              全體運作順暢 · 無待處理協助
+              目前不需要你
             </div>
           )}
         </div>
@@ -487,8 +495,8 @@ export default function PixelOfficeCanvas({
       </div>
 
       {/* Bottom-Right Subtle Control Hint */}
-      <div className="pointer-events-none absolute bottom-3 right-4 text-[11px] text-slate-400 bg-[#141720]/90 border border-[#252a3a] px-2.5 py-1 rounded">
-        點擊角色查看與協助 · 拖曳平移 · 滾輪縮放 · [N] 跳至求助夥伴
+      <div className="hidden md:block pointer-events-none absolute bottom-3 right-4 text-[11px] text-slate-400 bg-[#141720]/90 border border-[#252a3a] px-2.5 py-1 rounded">
+        點同事看詳情 · 拖曳平移 · 滾輪縮放 · [N] 下一位需要你的
       </div>
 
       {/* Crisp Hover Tooltip */}
@@ -515,11 +523,11 @@ export default function PixelOfficeCanvas({
                       : 'text-slate-400'
               }`}
             >
-              {STATUS_LABEL[hoveredWorker.worker.status]}
+              {hoveredWorker.worker.statusLabel ?? STATUS_LABEL[hoveredWorker.worker.status]}
             </span>
           </div>
           <div className="font-mono text-[11px] text-slate-400 truncate mb-1">
-            {hoveredWorker.worker.appName} · {hoveredWorker.worker.windowTitle}
+            {hoveredWorker.worker.appName} · {hoveredWorker.worker.phaseLabel ?? ''}
           </div>
           <p className="text-slate-300 leading-relaxed line-clamp-2">
             {hoveredWorker.worker.activity}

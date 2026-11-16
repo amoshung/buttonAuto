@@ -637,9 +637,9 @@ export function drawZoneSignage(ctx: CanvasRenderingContext2D, scale: number) {
   ctx.textBaseline = 'top';
   ctx.fillStyle = 'rgba(148, 163, 184, 0.72)';
 
-  ctx.fillText('DEV & IDE BAY', 2.2 * TILE_SIZE * scale, 2.2 * TILE_SIZE * scale);
-  ctx.fillText('BROWSER & QA', 13.2 * TILE_SIZE * scale, 2.2 * TILE_SIZE * scale);
-  ctx.fillText('COFFEE LOUNGE', 22 * TILE_SIZE * scale, 9.2 * TILE_SIZE * scale);
+  ctx.fillText('AUTOPILOT', 2.2 * TILE_SIZE * scale, 2.2 * TILE_SIZE * scale);
+  ctx.fillText('SUGGEST ONLY', 13.2 * TILE_SIZE * scale, 2.2 * TILE_SIZE * scale);
+  ctx.fillText('OFF · LOUNGE', 22 * TILE_SIZE * scale, 9.2 * TILE_SIZE * scale);
   ctx.fillText('MEETING NOOK', 5 * TILE_SIZE * scale, 12.3 * TILE_SIZE * scale);
   ctx.restore();
 }

@@ -57,6 +57,29 @@ export interface AgentWorker {
   core?: number;
   hourSends?: number;
   hourCap?: number;
+  approvalCommand?: string; // 代理等你允許執行的指令原文
+  statusLabel?: string; // 給人看的一句狀態（例如「等你允許」「代理停下來，助理接手推進」）
+  needsYou?: boolean;
+  chatTitle?: string;
+  pausedReason?: string;
+  acceptance?: AcceptanceItem[];
+  commits?: CommitInfo[];
+  nextStep?: { action: string; reason: string; prompt: string; at: string };
+  lastIssues?: string[];
+}
+
+export interface AcceptanceItem {
+  text: string;
+  status: 'verified' | 'claimed' | 'todo' | string;
+  manual: boolean;
+  checked: boolean;
+}
+
+export interface CommitInfo {
+  hash: string;
+  desc: string;
+  branch: string;
+  check: string;
 }
 
 export type SessionMode = 'auto' | 'suggest' | 'off';

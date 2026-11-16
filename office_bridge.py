@@ -13,7 +13,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from projects import contains_assistant
-from sessions import Session, SessionState, core_items, phase_label, phase_of
+from sessions import Session, SessionState, core_items, is_automated, phase_label, phase_of
 
 # 和 pixeloffice/lib/office-map.ts 的 DESK_SLOTS 相同（座位 = 角色坐的那一格）
 DESK_SEATS: Dict[str, Tuple[int, int]] = {
@@ -21,6 +21,8 @@ DESK_SEATS: Dict[str, Tuple[int, int]] = {
     "desk-5": (14, 5), "desk-6": (18, 5), "desk-7": (14, 10), "desk-8": (18, 10),
 }
 DESK_ORDER = ["desk-1", "desk-2", "desk-5", "desk-6", "desk-3", "desk-4", "desk-7", "desk-8"]
+# 辦公室分區：左邊大區給自動駕駛、右邊給只建議；關閉的同事去茶水間休息（座位照樣保留）
+ZONE_DESKS = {"auto": ["desk-1", "desk-2", "desk-3", "desk-4"], "suggest": ["desk-5", "desk-6", "desk-7", "desk-8"]}
 
 # 和 pixeloffice/lib/office-sim.ts 的 AVATAR_PRESETS 相同
 AVATARS: List[Dict[str, str]] = [
@@ -39,6 +41,7 @@ ACT_SEND_SUGGESTION = "送出助理建議的訊息"
 ACT_NEW_CHAT = "開新對話接續"
 ACT_DISMISS = "我看過了（清除提醒）"
 ACT_CUSTOM = "自訂協助指令"
+ACT_RESUME = "恢復自動駕駛"
 
 _LOG_TYPE = {"ask_human": "help_request", "approval_needed": "help_request", "blocked": "error", "loop": "error",
              "paused": "error", "observe": "status_change", "spec_review": "status_change", "verify": "status_change"}
@@ -66,23 +69,52 @@ def _short(text: str, n: int) -> str:
 
 
 def worker_status(st: SessionState, mode: str) -> str:
-    """工作階段 → 夥伴狀態（working／needs_help／idle／paused／error）。"""
+    """工作階段 → 角色動作（working＝打字、needs_help＝舉手、idle＝去茶水間、paused＝坐著等、error）。
+
+    關閉的視窗去茶水間；開著的視窗不論代理在不在忙都坐在自己的分區，代理停下來時是「坐著等」。
+    """
     if mode == "off":
-        return "paused"
+        return "idle"
     if needs_you(st, mode):
         return "needs_help"
     if st.agent_state == "error":
         return "error"
-    if phase_of(st) == "done" or st.agent_state in ("idle", "done", ""):
-        return "idle"
-    return "working"
+    if st.agent_state == "working":
+        return "working"
+    return "paused"
+
+
+def status_label(st: SessionState, mode: str) -> str:
+    """給人看的一句狀態（卡片與詳情的標籤）。"""
+    if mode == "off":
+        return "關閉中（助理不看也不動）"
+    if st.paused_reason:
+        return "自動駕駛已暫停"
+    approval = bool(st.pending_approval and st.approval_buttons)
+    if approval and mode == "suggest":
+        return "等你允許"
+    if [p for p in st.pending_human if not p.startswith("目標已達成")]:
+        return "需要你決定"
+    if approval:
+        return "等允許（助理判斷中）"
+    if mode == "suggest" and st.suggested_prompt:
+        return "建議好了，等你按送出"
+    if phase_of(st) == "done":
+        return "目標已達成"
+    if st.agent_state == "working":
+        return "代理工作中"
+    if st.agent_state == "error":
+        return "代理出錯"
+    if mode == "auto":
+        return "代理停下來，助理接手推進" if st.agent_state in ("waiting_input", "asking_choice") else "待命中"
+    return "代理停下來" if st.agent_state else "還沒有觀察紀錄"
 
 
 def needs_you(st: SessionState, mode: str) -> bool:
     if mode == "off":
         return False
-    if st.pending_approval and st.approval_buttons:
-        return True
+    if st.pending_approval and st.approval_buttons and mode != "auto":
+        return True  # 自動駕駛時由助理判斷；判斷不了才會放進 pending_human 交給你
     if [p for p in st.pending_human if not p.startswith("目標已達成")]:
         return True
     return mode == "suggest" and bool(st.suggested_prompt)
@@ -93,20 +125,29 @@ def help_and_actions(st: SessionState, mode: str) -> Tuple[str, List[str]]:
     if mode == "off":
         return "", []
     lines: List[str] = []
-    actions: List[str] = []
-    if st.pending_approval and st.approval_buttons:
-        lines.append("代理想執行：" + _short(st.pending_approval, 400))
-        actions += list(st.approval_buttons)
+    actions: List[str] = list(approval_choices(st))  # 要執行的指令另外用 approvalCommand 顯示
     if st.pending_human:
         lines.append("需要你決定：" + "；".join(st.pending_human[:5]))
     if mode == "suggest" and st.suggested_prompt:
         lines.append("助理建議送出：" + _short(st.suggested_prompt, 300))
         actions.append(ACT_SEND_SUGGESTION)
+    if st.paused_reason:
+        actions.append(ACT_RESUME)
     if st.pending_human:
         actions.append(ACT_DISMISS)
     if st.goal:
         actions.append(ACT_NEW_CHAT)
     return "\n".join(lines), actions
+
+
+_STOP = re.compile(r"^\W*(cancel|stop|revert|discard|undo|delete|取消|停止|復原|捨棄|刪除)\b", re.I)
+
+
+def approval_choices(st: SessionState) -> List[str]:
+    """代理正在等的允許選項；Cancel／Stop（停止代理）與 Revert／Discard（丟掉修改）不放在網頁上。"""
+    if not (st.pending_approval and st.approval_buttons):
+        return []
+    return [b for b in st.approval_buttons if not _STOP.match(b)]
 
 
 def worker_logs(sess: Session, n: int = 15) -> List[Dict[str, str]]:
@@ -146,13 +187,18 @@ class OfficeBridge:
             self._win_cache = (now, wins)
         return self._win_cache[1]
 
-    def _desk_for(self, key: str) -> str:
+    def _desk_for(self, key: str, mode: str) -> str:
+        """依模式分區給座位；同一個視窗在同一區時座位不變，換模式才換到另一區。"""
+        zone = ZONE_DESKS.get(mode)
         with self._lock:
-            if key not in self._desks:
-                used = set(self._desks.values())
-                free = [d for d in DESK_ORDER if d not in used]
-                self._desks[key] = free[0] if free else DESK_ORDER[len(self._desks) % len(DESK_ORDER)]
-            return self._desks[key]
+            cur = self._desks.get(key)
+            if cur and (zone is None or cur in zone):
+                return cur
+            used = {d for k, d in self._desks.items() if k != key}
+            pool = zone or DESK_ORDER
+            free = [d for d in pool if d not in used] or [d for d in DESK_ORDER if d not in used] or pool
+            self._desks[key] = free[0]
+            return free[0]
 
     def mode_of(self, st: SessionState) -> str:
         return "off" if contains_assistant(st.path, st.remote) else self.cfg.mode_of(st.key)
@@ -172,7 +218,7 @@ class OfficeBridge:
         for sess, w in self.sessions():
             st = sess.load()
             mode = self.mode_of(st)
-            desk = self._desk_for(st.key)
+            desk = self._desk_for(st.key, mode)
             seat = DESK_SEATS[desk]
             help_text, actions = help_and_actions(st, mode)
             core = core_items(st)
@@ -186,8 +232,11 @@ class OfficeBridge:
                 "windowTitle": st.chat_title or getattr(w, "title", "") or st.project,
                 "category": "ide",
                 "status": worker_status(st, mode),
+                "statusLabel": status_label(st, mode),
+                "needsYou": needs_you(st, mode),
                 "activity": st.current_task or st.status_summary or st.suggested_reason or "（還沒有觀察紀錄）",
                 "helpPrompt": help_text or None,
+                "approvalCommand": st.pending_approval[:2000] if (approval_choices(st) and mode != "off") else "",
                 "quickActions": actions,
                 "deskId": desk,
                 "avatar": AVATARS[_hash(st.key) % len(AVATARS)],
@@ -208,9 +257,20 @@ class OfficeBridge:
                 "core": len(core),
                 "hourSends": sum(1 for t in st.auto_send_times if t >= cut),
                 "hourCap": int(self.cfg.autopilot_max_per_hour),
+                "chatTitle": st.chat_title,
+                "pausedReason": st.paused_reason,
+                "acceptance": [{"text": a.get("text", "")[:200], "status": a.get("status", "todo"),
+                                "manual": not is_automated(a), "checked": bool(a.get("user_checked"))}
+                               for a in st.acceptance[:40]],
+                "commits": [{"hash": c.get("hash", "")[:10], "desc": c.get("desc", "")[:120],
+                             "branch": c.get("branch", ""), "check": c.get("check", "")}
+                            for c in st.commits[-6:]][::-1],
+                "nextStep": {"action": st.suggested_action, "reason": st.suggested_reason,
+                             "prompt": _short(st.suggested_prompt, 600), "at": st.suggested_at},
+                "lastIssues": list(st.last_issues[:6]),
             })
-        order = {"needs_help": 0, "error": 1, "working": 2, "idle": 3, "paused": 4}
-        workers.sort(key=lambda x: (order.get(x["status"], 5), x["name"]))
+        mode_order = {"auto": 0, "suggest": 1, "off": 2}
+        workers.sort(key=lambda x: (0 if x["needsYou"] else 1, mode_order.get(x["mode"], 3), x["name"]))
         return {"workers": workers, "commands": [], "lastUpdated": datetime.datetime.now().astimezone().isoformat(),
                 "externalEventsCount": 0, "running": bool(self.running()), "usage": usage or {}}
 
@@ -227,6 +287,14 @@ class OfficeBridge:
         st = sess.load()
         mode = self.mode_of(st)
         label, message = (label or "").strip(), (message or "").strip()
+        if label == ACT_RESUME:
+            def resume(s) -> None:
+                s.pending_human = [p for p in s.pending_human if p != s.paused_reason]
+                s.paused_reason = ""
+                s.evidence_attempts = 0
+            sess.update(resume)
+            sess.history("resume", by="user")
+            return self._ok(key, "已恢復自動駕駛")
         if label == ACT_DISMISS:
             sess.update(lambda s: setattr(s, "pending_human", []))
             sess.history("web_decide", action="dismiss", by="user")
@@ -235,7 +303,7 @@ class OfficeBridge:
             return {"ok": False, "text": "這個視窗的模式是「關閉」，助理不會操作它。先切到「只建議」或「自動駕駛」。"}
         if self.worker is None:
             return {"ok": False, "text": "助理的背景執行緒沒有啟動"}
-        if label in st.approval_buttons and st.pending_approval:
+        if label in approval_choices(st):
             self.worker.request_click(key, label)
             sess.history("web_decide", button=label, by="user")
             return self._ok(key, f"已排入：代按「{label}」")

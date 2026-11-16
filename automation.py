@@ -165,7 +165,11 @@ def approvals_from_roles(roles: Dict[str, str], controls: List[str], keyword_hit
         if any(ud.name_in(b, ONE_TIME_ALLOW) for b in keyword_hits):
             return keyword_hits
         return []
-    return [c for c in controls if roles.get(c) in APPROVAL_ROLES]
+    # Cancel／Stop 會停止代理整段工作、Revert／Discard 會丟掉代理的修改：都不是回答這次的允許，不列入
+    return [c for c in controls if roles.get(c) in APPROVAL_ROLES and not STOP_OR_DISCARD.match(c)]
+
+
+STOP_OR_DISCARD = re.compile(r"^\W*(cancel|stop|revert|discard|undo|delete|取消|停止|復原|捨棄|刪除)\b", re.I)
 
 
 def build_state_text(app_name: str, vs: Dict[str, Any], panel_text: str) -> str:
@@ -1256,6 +1260,21 @@ class AutomationWorker(threading.Thread):
             if g:
                 goal_prop = snap.agent_goal_proposal
                 self._session(w, "💡 已依計畫文件推測目標，按「詳情」確認或修改")
+
+        if not snap.goal and self.cfg.mode_of(w.key) == "auto" and (goal_prop or snap.agent_goal_proposal):
+            # 自動駕駛：直接採用代理說明或助理推測的目標往下推進（不等你確認，詳情可隨時修改）
+            g = (goal_prop or snap.agent_goal_proposal)
+            g = g[len(drv.INFERRED_PREFIX):] if g.startswith(drv.INFERRED_PREFIX) else g
+
+            def adopt(st, g=g) -> None:
+                record_props(st)
+                st.goal, st.goal_source, st.goal_confirmed_at = g.strip(), "auto", now_str()
+                st.agent_goal_proposal = ""
+                st.pending_human = [p for p in st.pending_human if "目標" not in p]
+                st.add_interaction("goal", f"自動駕駛採用目標：{g[:100]}")
+            snap = sess.update(adopt, specs, plans)
+            sess.history("goal", goal=snap.goal, by="assistant")
+            self._log(f"🎯 [{self._app_name(w)}] 自動駕駛採用目標：{snap.goal[:60]}")
 
         if not snap.goal:
             if goal_prop:

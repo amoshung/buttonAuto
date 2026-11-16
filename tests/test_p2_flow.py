@@ -293,3 +293,18 @@ def test_model_can_choose_new_chat_and_new_chat_rebinds(tmp_path):
     sess.update(lambda st: setattr(st, "rollover_at", now_str()))
     assert w._other_chat(pw, "代理取的新標題") is False  # 助理剛開的新對話：跟著重新綁定
     assert sess.load().chat_title == "代理取的新標題"
+
+
+def test_autopilot_adopts_a_pending_goal_proposal(tmp_path, monkeypatch):
+    import automation
+    import driver as drv
+    monkeypatch.setattr(automation.AutomationWorker, "_maybe_autosend", lambda self, w: None)
+    w = _worker(tmp_path)
+    pw = ProjectWindow(9, "kiro", "Kiro", "t", "proj", "", str(tmp_path), False, False)
+    w.cfg.set_mode(pw.key, "auto")
+    sess = w._session_for(pw)
+    sess.update(lambda st: (setattr(st, "agent_goal_proposal", drv.INFERRED_PREFIX + "完成 Plan 5 U2"),
+                            setattr(st, "goal_inferred_at", now_str()), st.pending_human.append("確認目標")))
+    w._drive(pw, {"agent_state": "waiting_input", "summary": "停"}, "代理：U1 完成，要繼續嗎？", FakeJudge())
+    st = sess.load()
+    assert st.goal == "完成 Plan 5 U2" and st.goal_source == "auto" and "確認目標" not in st.pending_human

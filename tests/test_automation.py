@@ -451,3 +451,9 @@ def test_cancel_alone_is_not_an_approval():
     from automation import approvals_from_roles
     assert approvals_from_roles({"Cancel": "deny", "Add context": "other"}, ["Cancel", "Add context"], []) == []
     assert approvals_from_roles({"Allow": "other", "Deny": "deny"}, ["Allow", "Deny"], ["Allow", "Deny"]) == ["Allow", "Deny"]
+
+
+def test_destructive_buttons_are_not_approval_choices():
+    from automation import approvals_from_roles
+    roles = {"Allow": "allow_once", "Revert changes (11)": "deny", "\uea70 View changes (11)": "other", "Cancel": "skip"}
+    assert approvals_from_roles(roles, list(roles), []) == ["Allow"]
