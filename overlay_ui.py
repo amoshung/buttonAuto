@@ -17,7 +17,7 @@ from automation import AutomationWorker, make_clients
 from config import AppConfig, DEFAULT_CONFIG_PATH
 from projects import ProjectDetector, ProjectWindow, contains_assistant
 from driver import build_docs_question, build_goal_question, doc_candidates
-from sessions import now_str, phase_label, phase_of, read_kiro_specs, read_plans
+from sessions import is_automated, now_str, phase_label, phase_of, read_kiro_specs, read_plans
 from uia_driver import name_in as ud_name_in
 from clicker import ClickController
 from scanner import ScreenScanner, read_image_unicode, write_image_unicode
@@ -34,6 +34,29 @@ FONT_B = ("Microsoft JhengHei UI", 9, "bold")
 FONT_S = ("Microsoft JhengHei UI", 8)
 
 APP_NAME = "AI 工程助理"
+
+
+def _code_version() -> str:
+    try:
+        import subprocess
+        p = subprocess.run(["git", "-C", BASE_DIR, "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+                           timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout.strip()
+    except Exception:
+        pass
+    return "dev"
+
+
+def _code_mtime() -> float:
+    try:
+        return max(os.path.getmtime(os.path.join(BASE_DIR, f)) for f in os.listdir(BASE_DIR) if f.endswith(".py"))
+    except (OSError, ValueError):
+        return 0.0
+
+
+CODE_VERSION = _code_version()
+CODE_MTIME_AT_START = _code_mtime()
 
 MODE_TEXT = {"off": "關閉", "suggest": "只建議", "auto": "自動駕駛"}
 MODE_COLOR = {"off": "#64748B", "suggest": "#38BDF8", "auto": "#22C55E"}
@@ -105,7 +128,7 @@ class FloatingOverlayApp:
 
     # ------------------------------------------------------------------ 視窗與版面
     def _setup_window(self) -> None:
-        self.root.title(f"🤖 {APP_NAME}")
+        self.root.title(f"🤖 {APP_NAME} · {CODE_VERSION}")
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.96)
         self.root.configure(bg=BG)
@@ -158,6 +181,9 @@ class FloatingOverlayApp:
 
         self.status_lbl = _label(self.body, "狀態：待機中 | 累計動作：0 次", fg="#CBD5E1")
         self.status_lbl.pack(fill="x", pady=(0, 4))
+        self.update_banner = tk.Label(self.body, text="⬆ 程式已更新：關掉助理並重新執行 run.bat 才會套用", bg="#B45309",
+                                      fg="#FFFFFF", font=FONT_B, pady=3)
+        self._last_update_check = 0.0
 
         mode_frame = tk.Frame(self.body, bg=BG)
         mode_frame.pack(fill="x", pady=(0, 6))
@@ -961,6 +987,10 @@ class FloatingOverlayApp:
         self._drain_events()
         if time.monotonic() - self._last_session_refresh > 3.0:
             self._refresh_sessions()
+        if time.monotonic() - self._last_update_check > 30.0:
+            self._last_update_check = time.monotonic()
+            if _code_mtime() > CODE_MTIME_AT_START + 1 and not self.update_banner.winfo_ismapped():
+                self.update_banner.pack(fill="x", pady=(0, 4), after=self.status_lbl)
 
         now = time.monotonic()
         if self.is_running and self.cfg.mode == "image" and (now - self.last_scan_time) >= self.cfg.scan_interval:
@@ -1071,6 +1101,7 @@ class SessionDialog:
         self.acc_list = tk.Listbox(self.p2_box, height=4, bg=BG2, fg="#FFFFFF", font=("Microsoft JhengHei UI", 8),
                                    activestyle="none", bd=0, highlightthickness=0, selectbackground=BG2)
         self.acc_list.pack(fill="x", pady=(2, 2))
+        self.acc_list.bind("<Double-Button-1>", self._toggle_manual_item)
         arow = tk.Frame(self.p2_box, bg=BG)
         arow.pack(fill="x")
         self.confirm_btn = _button(arow, "✅ 確認驗收 spec", self.confirm_spec, bg="#0284C7")
@@ -1209,12 +1240,38 @@ class SessionDialog:
         self.acc_list.delete(0, "end")
         icon = {"verified": "✅", "claimed": "🟡", "todo": "⬜"}
         for a in st.acceptance:
-            self.acc_list.insert("end", f"{icon.get(a.get('status', 'todo'), '⬜')} {a.get('text', '')}")
+            if is_automated(a):
+                mark = icon.get(a.get("status", "todo"), "⬜")
+                self.acc_list.insert("end", f"{mark} {a.get('text', '')}")
+            else:
+                mark = "☑" if a.get("user_checked") else "☐"
+                self.acc_list.insert("end", f"{mark} 👁 手動：{a.get('text', '')}（雙擊打勾）")
         if not st.acceptance:
             self.acc_list.insert("end", "（驗收條件尚未提出）")
         can_confirm = bool(st.acceptance) and not st.acceptance_confirmed_at
         self.confirm_btn.configure(state="normal" if can_confirm else "disabled")
         self.rollover_btn.configure(state="normal" if st.goal else "disabled")
+
+    def _toggle_manual_item(self, _e=None) -> None:
+        sel = self.acc_list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        st = self.sess.load()
+        if idx >= len(st.acceptance) or is_automated(st.acceptance[idx]):
+            self.result_lbl.configure(text="自動化項目由助理依測試報告查核，不能手動打勾。", fg=FG_DIM)
+            return
+
+        def mutate(s, idx=idx) -> None:
+            a = s.acceptance[idx]
+            a["user_checked"] = "" if a.get("user_checked") else now_str()
+            manual = [x for x in s.acceptance if not is_automated(x)]
+            if manual and all(x.get("user_checked") for x in manual):
+                s.pending_human = [p for p in s.pending_human if "手動檢查" not in p]
+            s.add_interaction("manual_check", f"{'打勾' if a['user_checked'] else '取消'}：{a['text'][:60]}")
+        self.sess.update(mutate)
+        self.sess.history("manual_check", index=idx, by="user")
+        self.reload()
 
     def resume_autopilot(self) -> None:
         def mutate(st) -> None:

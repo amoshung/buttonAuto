@@ -374,3 +374,11 @@ def test_decide_plan_uses_p_human_not_top_confidence():
     worried = dict(spread, action={"choice": "click_button", "confidence": 0.5,
                                    "probabilities": {"click_button": 0.5, "ask_human": 0.45}})
     assert decide_plan({"action_buttons": ["Submit"]}, worried, cfg, True).kind == "ask_human"
+
+
+def test_service_trouble_detection():
+    from automation import is_service_trouble
+    for m in ["視覺模型回應 429：Too Many Requests", "視覺模型連線失敗：Read timed out", "Decision-1 回應 503",
+              "HTTPConnectionPool: Max retries exceeded"]:
+        assert is_service_trouble(m)
+    assert not is_service_trouble("判斷模型回覆無法解析")

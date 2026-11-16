@@ -146,6 +146,11 @@ def build_decision_questions(action_buttons: List[str]) -> Dict[str, Dict[str, A
     return q
 
 
+def is_service_trouble(msg: str) -> bool:
+    """AI 服務本身的問題（壅塞、逾時、連不上），不是這個視窗的問題。"""
+    return bool(re.search(r"\b(429|502|503|504)\b|連線失敗|timed? ?out|逾時|Max retries|Connection", msg or "", re.I))
+
+
 def is_persistent_choice(name: str) -> bool:
     """「Always allow」「一律允許」這類會永久記住的選項。"""
     n = ud.normalize_name(name)
@@ -577,7 +582,10 @@ class AutomationWorker(threading.Thread):
         self.commands: "queue.Queue[tuple]" = queue.Queue()
         self._last_summary_date = ""
         self._ctx_cache: Dict[str, Tuple[float, List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
-        self._aborted: Dict[str, str] = {}  # 被使用者輸入中止的訊息（輸入框可能留下半截）
+        self._aborted: Dict[str, str] = {}
+        self._ai_backoff = 0.0
+        self._ai_backoff_until = 0.0
+        self._restored_at: Dict[int, float] = {}  # 被使用者輸入中止的訊息（輸入框可能留下半截）
         try:
             wu.InputMonitor.get()  # 盡早掛上輸入偵測
         except Exception:
@@ -1487,8 +1495,13 @@ class AutomationWorker(threading.Thread):
 
     # ---- 階段二：AI 代理模式
     def _ai_round(self) -> None:
+        if time.monotonic() < self._ai_backoff_until:
+            left = self._ai_backoff_until - time.monotonic()
+            self._emit("status", text=f"AI 服務壅塞或連不上，{left:.0f} 秒後重試")
+            return
         vision, judge, decision = make_clients(self.settings_loader())
         windows = self._watched_windows()
+        service_trouble = False
         alive = {w.hwnd for w in windows}
         with self._lock:
             for h in [h for h in self.humans if h not in alive]:
@@ -1505,11 +1518,29 @@ class AutomationWorker(threading.Thread):
                 continue
             except AIError as e:
                 self._log(f"⚠ [{self._app_name(w)}] {e}")
+                if is_service_trouble(str(e)):
+                    service_trouble = True
+                    break  # 其他視窗也會遇到同樣的問題，這一輪先停
             except Exception as e:
                 self._log(f"⚠ [{self._app_name(w)}] 處理失敗：{e!r}")
+        if service_trouble:
+            self._ai_backoff = min(300.0, max(15.0, self._ai_backoff * 2))
+            self._ai_backoff_until = time.monotonic() + self._ai_backoff
+            self._log(f"⏳ AI 服務壅塞或連不上，{self._ai_backoff:.0f} 秒後重試")
+        else:
+            self._ai_backoff = 0.0
 
     def _ai_window(self, w: wu.WindowInfo, vision: VisionClient, judge: VisionClient, decision) -> None:
         if w.iconic:
+            # 自動駕駛時，最小化的視窗無法觀察：在你沒有按鍵盤滑鼠時，把它還原到所有視窗的最後面（不搶焦點）
+            now = time.monotonic()
+            if (self.cfg.mode_of(w.key) == "auto" and wu.real_idle_seconds() >= self.cfg.ai_idle_sec
+                    and now - self._restored_at.get(w.hwnd, 0.0) > 600):
+                if wu.restore_behind(w.hwnd):
+                    self._restored_at[w.hwnd] = now
+                    self._log(f"🗗 [{self._app_name(w)}] 視窗最小化：已在背景還原（放在最後面，不搶焦點）")
+                    self._session(w, "🗗 已在背景還原最小化的視窗，下一輪繼續觀察")
+                    return
             self._session(w, MINIMIZED_TEXT)
             return
         now = time.monotonic()

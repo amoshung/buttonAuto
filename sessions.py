@@ -141,7 +141,7 @@ def render_progress(s: SessionState, specs: Optional[List[Dict[str, Any]]] = Non
                 extra.append(f"如何查核：{a['how']}")
             if a.get("test"):
                 extra.append(f"測試：{a['test']}")
-            tag = "" if is_automated(a) else "👁 手動檢查："
+            tag = "" if is_automated(a) else ("👁 手動檢查（你已確認）：" if a.get("user_checked") else "👁 手動檢查：")
             out.append(f"- [{mark.get(a.get('status', 'todo'), ' ')}] {tag}{a.get('text', '')}"
                        + (f"（{'；'.join(extra)}）" if extra else ""))
         out.append(f"（{s.acceptance_confirmed_at} 你確認）" if s.acceptance_confirmed_at else "（草稿，等你確認後才開始實作）")

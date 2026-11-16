@@ -113,6 +113,25 @@ def is_iconic(hwnd: int) -> bool:
     return bool(user32.IsIconic(hwnd))
 
 
+SW_SHOWNOACTIVATE = 4
+HWND_BOTTOM = 1
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+user32.ShowWindow.argtypes = [VP, ctypes.c_int]
+user32.SetWindowPos.argtypes = [VP, VP, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+
+
+def restore_behind(hwnd: int) -> bool:
+    """把最小化的視窗還原到所有視窗的最後面，不啟用、不搶焦點。"""
+    if not is_iconic(hwnd):
+        return True
+    fg = get_foreground()
+    user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+    user32.SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+    if fg and get_foreground() != fg and is_window(fg):
+        activate_window(fg)  # 萬一系統還是把焦點給了它，立刻還回去
+    return not is_iconic(hwnd)
+
+
 def get_window_rect(hwnd: int) -> Tuple[int, int, int, int]:
     r = W.RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(r))
