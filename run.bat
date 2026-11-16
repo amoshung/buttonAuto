@@ -10,18 +10,18 @@ if exist "C:\Program Files\Python313\python.exe" (
     set "PY_EXE=python"
 )
 
-echo [ButtonAuto] Using Python: "%PY_EXE%"
-"%PY_EXE%" -c "import cv2, mss, PIL, numpy" 2>nul
+echo [AI Engineering Assistant] Using Python: "%PY_EXE%"
+"%PY_EXE%" -c "import cv2, mss, PIL, numpy, uiautomation, requests" 2>nul
 if errorlevel 1 (
-    echo [ButtonAuto] Installing required packages...
+    echo [AI Engineering Assistant] Installing required packages...
     "%PY_EXE%" -m pip install -r requirements.txt
 )
 
-echo [ButtonAuto] Starting Floating Overlay UI...
-echo [ButtonAuto] Keep this window minimized or close the GUI to exit.
+echo [AI Engineering Assistant] Starting control panel...
+echo [AI Engineering Assistant] Keep this window minimized or close the GUI to exit.
 "%PY_EXE%" "%~dp0main.py"
 if errorlevel 1 (
     echo.
-    echo [ButtonAuto] Exited with an error. Press any key to close...
+    echo [AI Engineering Assistant] Exited with an error. Press any key to close...
     pause >nul
 )

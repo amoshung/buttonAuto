@@ -3,3 +3,16 @@ __pycache__/
 *$py.class
 .pytest_cache/
 error.log
+
+# API 金鑰與內部服務文件（勿提交）
+Y6P2_Decision-1.md
+Y6P2_liteLLMAPI.md
+Y6P2_Wiki_API.md
+中鋼主權AI_KEY.md
+中鋼主權AI網站.md
+secrets.local.json
+automation.log
+sessions/
+reports/
+# 本機狀態：勾選的工作階段、本機路徑、自訂目標清單
+config.json

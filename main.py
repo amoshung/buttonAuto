@@ -22,7 +22,7 @@ def main() -> None:
         except Exception:
             pass
         try:
-            messagebox.showerror("按鈕精靈啟動錯誤", f"發生未預期的錯誤：\n{err}")
+            messagebox.showerror("AI 工程助理啟動錯誤", f"發生未預期的錯誤：\n{err}")
         except Exception:
             pass
         raise
