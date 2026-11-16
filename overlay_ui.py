@@ -133,13 +133,13 @@ class FloatingOverlayApp:
         self.root.attributes("-alpha", 0.96)
         self.root.configure(bg=BG)
 
+        width, height = 410, 680
         cx, cy = self.root.winfo_pointerxy()
-        if cx <= 0 and cy <= 0:
-            x_pos, y_pos = 120, 120
-        else:
-            x_pos = max(40, cx - 150)
-            y_pos = max(40, cy - 60)
-        self.root.geometry(f"410x680+{x_pos}+{y_pos}")
+        left, top, right, bottom = wu.work_area_at(cx, cy)
+        height = min(height, bottom - top - 20)
+        x_pos = min(max(left + 10, cx - 150), right - width - 10)
+        y_pos = min(max(top + 10, cy - 60), bottom - height - 10)
+        self.root.geometry(f"{width}x{height}+{x_pos}+{y_pos}")
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()

@@ -350,6 +350,21 @@ user32.GetShellWindow.restype = VP
 user32.GetDesktopWindow.restype = VP
 
 
+user32.MonitorFromPoint.restype = VP
+user32.MonitorFromPoint.argtypes = [W.POINT, W.DWORD]
+
+
+def work_area_at(x: int, y: int) -> Tuple[int, int, int, int]:
+    """(x, y) 所在螢幕的工作區（扣掉工作列）。"""
+    mon = user32.MonitorFromPoint(W.POINT(int(x), int(y)), 2)  # MONITOR_DEFAULTTONEAREST
+    info = _MONITORINFO()
+    info.cbSize = ctypes.sizeof(_MONITORINFO)
+    if mon and user32.GetMonitorInfoW(mon, ctypes.byref(info)):
+        r = info.rcWork
+        return r.left, r.top, r.right, r.bottom
+    return 0, 0, 1280, 720
+
+
 def foreground_is_fullscreen() -> bool:
     fg = get_foreground()
     if not fg or fg in (int(user32.GetShellWindow() or 0), int(user32.GetDesktopWindow() or 0)):

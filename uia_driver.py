@@ -384,9 +384,16 @@ def input_text(control) -> str:
     return ""
 
 
+_FORMAT_CHARS = re.compile(r"[\s`*_#>：:]+")
+
+
 def same_text(a: str, b: str) -> bool:
-    """忽略空白與換行的逐字比對（ProseMirror 會把換行轉成段落）。"""
-    return re.sub(r"\s+", "", a or "") == re.sub(r"\s+", "", b or "")
+    """逐字比對，但忽略空白、換行與 Markdown 格式符號。
+
+    Kiro 的輸入框會把 `程式碼` 轉成程式碼樣式（反引號消失）、把檔案路徑轉成標籤（前面的冒號被吃掉）；
+    這些不影響訊息內容。要抓的是輸入法打亂順序、漏字這類真正的錯誤。
+    """
+    return _FORMAT_CHARS.sub("", a or "") == _FORMAT_CHARS.sub("", b or "")
 
 
 def input_has_draft(control) -> bool:

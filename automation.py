@@ -146,6 +146,12 @@ def build_decision_questions(action_buttons: List[str]) -> Dict[str, Dict[str, A
     return q
 
 
+def asks_clear(tail: str) -> bool:
+    """代理最後的訊息是否在要求使用者清空對話（/clear）後再說「繼續」。"""
+    t = (tail or "")[-600:]
+    return bool(re.search(r"/clear", t, re.I) and re.search(r"繼續|continue", t, re.I))
+
+
 def is_service_trouble(msg: str) -> bool:
     """AI 服務本身的問題（壅塞、逾時、連不上），不是這個視窗的問題。"""
     return bool(re.search(r"\b(429|502|503|504)\b|連線失敗|timed? ?out|逾時|Max retries|Connection", msg or "", re.I))
@@ -736,6 +742,7 @@ class AutomationWorker(threading.Thread):
         def fail(why: str) -> bool:
             self._log(f"⛔ 送出失敗（{key}）：{why}")
             self._emit("send_result", key=key, ok=False, text=why)
+            self._emit("session", key=key, text=f"⛔ 送出失敗：{why}")
             return False
 
         text = (text or "").strip()
@@ -928,6 +935,12 @@ class AutomationWorker(threading.Thread):
             self._session(w, f"⏳ 已達每小時自動送出上限（{n} 次），稍後再送")
             return
         why = self._user_guard(w, typing=True)
+        if why and ("秒前按過" in why or "Ctrl" in why):
+            deadline = time.monotonic() + 20.0  # 最多等 20 秒；你一停手就送
+            while why and ("秒前按過" in why or "Ctrl" in why) and time.monotonic() < deadline \
+                    and not self._stop.is_set() and self.running.is_set():
+                time.sleep(0.3)
+                why = self._user_guard(w, typing=True)
         if why:
             self._session(w, f"⏳ 有建議等著自動送出：{why}")
             return
@@ -1140,6 +1153,13 @@ class AutomationWorker(threading.Thread):
             return
 
         phase = phase_of(snap)
+        tail_now = drv2.agent_tail(panel_text)
+        if phase in ("spec", "build") and asks_clear(tail_now) and snap.suggested_action != "rollover":
+            self._set_suggestion(w, sess, specs, plans, h, base, record_props, "rollover",
+                                 drv2.build_continuation_prompt(snap),
+                                 "代理要求清空對話後再繼續：開新對話並送出進度摘要（之後再繼續原本的步驟）")
+            self._maybe_autosend(w)
+            return
         if phase == "done":
             self._drive_after_done(w, sess, snap, agent_state, panel_text, judge, specs, plans, candidates, h, base)
             return
@@ -1321,10 +1341,7 @@ class AutomationWorker(threading.Thread):
         if snap.evidence_requested_at:
             self._verify_report(w, sess, snap, panel_text, judge, args, local)
             return
-        if re.search(r"(請|please)?\s*(執行|run|輸入|type)?\s*`?/clear`?", tail, re.I) and re.search(r"繼續|continue", tail, re.I):
-            self._set_suggestion(*args, "rollover", drv2.build_continuation_prompt(snap),
-                                 "代理要求清空對話後再繼續：開新對話並送出進度摘要")
-            return
+
         if len(snap.recent_tails) >= 2 and drv2.is_looping(snap.recent_tails[:-1], snap.recent_tails[-1]) \
                 and drv2.is_looping(snap.recent_tails, tail):
             sess.history("loop", text="代理連續 3 次停在幾乎相同的內容")

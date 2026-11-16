@@ -382,3 +382,18 @@ def test_service_trouble_detection():
               "HTTPConnectionPool: Max retries exceeded"]:
         assert is_service_trouble(m)
     assert not is_service_trouble("判斷模型回覆無法解析")
+
+
+def test_same_text_ignores_kiro_markdown_formatting():
+    from uia_driver import same_text
+    sent = "請把結果寫到這個檔案（Markdown）：`D:\\a\\draft.md`，寫好後回覆「已寫入」。\n1. 條件：… | 驗證方式：…"
+    kiro = "請把結果寫到這個檔案（Markdown）D:\\a\\draft.md，寫好後回覆「已寫入」。1. 條件… | 驗證方式…"
+    assert same_text(kiro, sent)
+    assert not same_text("請只回覆收到，，。", "請只回覆「收到」，")  # 輸入法打亂順序仍會被抓到
+    assert not same_text("請把結果寫到", sent)  # 漏字仍會被抓到
+
+
+def test_asks_clear():
+    from automation import asks_clear
+    assert asks_clear("context 已接近 60%，請執行 /clear。/clear 之後告訴我「繼續」")
+    assert not asks_clear("我會先清掉暫存檔再繼續")
