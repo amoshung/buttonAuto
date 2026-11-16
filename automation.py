@@ -606,6 +606,8 @@ class AutomationWorker(threading.Thread):
             return "你正在使用全螢幕程式"
         if by == "user":
             return ""
+        if not typing and (w is None or wu.get_foreground() != w.hwnd):
+            return ""  # 代按不影響你在其他視窗的操作，不用等
         idle = wu.real_idle_seconds()
         need = float(self.cfg.ai_idle_sec)
         if idle < need or wu.modifier_keys_down():
@@ -1050,6 +1052,29 @@ class AutomationWorker(threading.Thread):
 
         if goal_prop or docs_prop:
             sess.history("proposal", goal=goal_prop, active_docs=docs_prop)
+
+        if not snap.goal and not snap.agent_goal_proposal and not snap.goal_inferred_at and not goal_prop:
+            g, task, doc = drv.parse_goal_infer(
+                judge.chat(drv.build_goal_infer_prompt(panel_text, candidates), max_tokens=700, temperature=0),
+                candidates)
+
+            def inferred(st, g=g, task=task, doc=doc) -> None:
+                st.goal_inferred_at = now_str()
+                if g:
+                    st.agent_goal_proposal = drv.INFERRED_PREFIX + g
+                    if "確認目標" not in st.pending_human:
+                        st.pending_human.append("確認目標")
+                if task:
+                    st.current_task = task
+                if doc and not st.active_docs and not st.agent_active_docs_proposal:
+                    st.agent_active_docs_proposal = [doc]
+                st.add_interaction("goal_inferred", g[:120] or "（看不出目標）")
+
+            snap = sess.update(inferred, specs, plans)
+            sess.history("goal_inferred", goal=g, task=task, doc=doc)
+            if g:
+                goal_prop = snap.agent_goal_proposal
+                self._session(w, "💡 已依計畫文件推測目標，按「詳情」確認或修改")
 
         if not snap.goal:
             if goal_prop:

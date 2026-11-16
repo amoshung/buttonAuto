@@ -42,6 +42,8 @@ class SessionState:
     goal_confirmed_at: str = ""
     agent_goal_proposal: str = ""
     goal_question_sent_at: str = ""
+    goal_inferred_at: str = ""   # 助理已依計畫文件推測過目標（只推測一次，使用者採用或改寫後就不再用）
+    current_task: str = ""       # 代理目前正在做的任務（推測），顯示在詳情與清單上
     # 正在進行的計畫文件（專案內相對路徑；spec 用 .kiro/specs/<名稱>）。由使用者勾選，或採用代理的判斷
     active_docs: List[str] = field(default_factory=list)
     active_docs_by: str = ""  # user / agent

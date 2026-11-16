@@ -1131,6 +1131,8 @@ class SessionDialog:
         self._fill_p2(st)
         if st.agent_goal_proposal:
             self.proposal_lbl.configure(text=st.agent_goal_proposal)
+            self.proposal_box.configure(text=" 🤖 助理推測的目標（按「採用」後可修改） " if
+                                        st.agent_goal_proposal.startswith("（助理依") else " 🤖 代理說明的最終目標（待你採用） ")
             self.proposal_box.pack(fill="x", pady=(0, 4), before=self.docs_toggle)
             self.adopt_btn.configure(state="normal")
         else:
@@ -1169,6 +1171,9 @@ class SessionDialog:
         mode = self.app.cfg.mode_of(self.pw.key)
         self.mode_cb.set(MODE_TEXT[mode])
         notes = []
+        doing = st.current_task or st.status_summary
+        if doing:
+            notes.append(f"代理目前在做：{doing}")
         if mode == "off":
             notes.append("模式是「關閉」：助理不會看也不會操作這個視窗")
         if not self.app.is_running:
