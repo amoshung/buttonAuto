@@ -133,6 +133,12 @@ def build_decision_questions(action_buttons: List[str]) -> Dict[str, Dict[str, A
     return q
 
 
+def is_persistent_choice(name: str) -> bool:
+    """「Always allow」「一律允許」這類會永久記住的選項。"""
+    n = ud.normalize_name(name)
+    return n.startswith("always ") or n.startswith("一律") or "don't ask again" in n or "不再詢問" in n
+
+
 def _noul(answers: Dict[str, Any], name: str, default: float) -> float:
     try:
         return float(answers[name]["noul"])
@@ -182,6 +188,11 @@ def decide_plan(
             return Plan("ask_human", f"按鈕「{name}」信心度 {b_conf:.2f} 不足", scores=scores)
         if ud.name_in(name, cfg.never_click):
             return Plan("ask_human", f"按鈕「{name}」在禁止點擊清單中", scores=scores)
+        if is_persistent_choice(name):
+            allow = [b for b in buttons if ud.name_in(b, ["Allow", "允許", "Run", "Accept", "執行"])]
+            if not allow:
+                return Plan("ask_human", f"「{name}」會永久改變 IDE 的信任設定，助理不會代按", scores=scores)
+            name = allow[0]
         return Plan("click", f"點擊「{name}」", button=name, scores=scores)
 
     if action in ("continue", "reply"):
@@ -609,6 +620,9 @@ class AutomationWorker(threading.Thread):
                 st.sends_in_conversation = 0
                 st.recent_tails = []
             st.sends_in_conversation += 1
+            if by == "user":
+                # 使用者親自回覆，視為已處理先前交給他的取捨
+                st.pending_human = [p for p in st.pending_human if not p.startswith("驗收 spec 需要你決定")]
             if by == "assistant":
                 st.auto_send_times = (st.auto_send_times + [now_str()])[-50:]
             st.add_interaction("sent" if by == "user" else "auto_sent", text)
@@ -928,6 +942,18 @@ class AutomationWorker(threading.Thread):
     def _local_path(self, w: ProjectWindow) -> str:
         return w.path if (w.path and not w.remote and os.path.isdir(w.path)) else ""
 
+    def _repo_path(self, w: ProjectWindow, st) -> str:
+        """查核用的 repo：工作階段有指定就用指定的（必須在專案路徑底下），否則用專案路徑。"""
+        local = self._local_path(w)
+        if not local:
+            return ""
+        rp = (st.repo_path or "").strip()
+        if rp:
+            full = os.path.normpath(rp if os.path.isabs(rp) else os.path.join(local, rp))
+            if os.path.normcase(full).startswith(os.path.normcase(os.path.normpath(local))) and os.path.isdir(full):
+                return full
+        return local
+
     def _drive_spec(self, w, sess, snap, panel_text, judge, specs, plans, candidates, h, base, record_props) -> None:
         """② 與代理討論出驗收 spec；定稿後等使用者確認。"""
         args = (w, sess, specs, plans, h, base, record_props)
@@ -939,9 +965,17 @@ class AutomationWorker(threading.Thread):
         if snap.acceptance and not snap.spec_issues and "確認驗收 spec" in snap.pending_human:
             self._set_suggestion(*args, "await_spec_confirm", "", "驗收 spec 已定稿，請在面板上確認後才開始實作")
             return
-        text = drv2.read_new_file(spec_file, snap.spec_requested_at) or panel_text
-        items = drv2.parse_spec_items(judge.chat(drv2.build_spec_extract_prompt(text, snap.goal),
-                                                 max_tokens=2000, temperature=0))
+        waiting = [p for p in snap.pending_human if p.startswith("驗收 spec 需要你決定")]
+        if waiting:
+            # 已經把取捨交給使用者：在使用者回覆之前不重新審查，避免同一個問題一直重複
+            self._session(w, "🙋 等你回覆驗收 spec 的取捨：" + waiting[0][len("驗收 spec 需要你決定："):][:60])
+            return
+        file_text = drv2.read_new_file(spec_file, snap.spec_requested_at)
+        text = file_text or drv2.latest_spec_segment(panel_text)
+        items = drv2.parse_spec_lines(text)
+        if not items and text.strip():
+            items = drv2.parse_spec_items(judge.chat(drv2.build_spec_extract_prompt(text, snap.goal),
+                                                     max_tokens=8000, temperature=0))
         if not items:
             self._drive_generic(w, sess, snap, {"agent_state": snap.agent_state}, panel_text, judge, specs, plans,
                                 candidates, h, base, record_props)
@@ -1042,7 +1076,8 @@ class AutomationWorker(threading.Thread):
         source = snap.report_path if report else "聊天內容"
         if not report:
             report = panel_text[-9000:]
-        facts = verifier.gather_facts(local, report) if local else {"is_repo": False}
+        repo = self._repo_path(w, snap) if local else ""
+        facts = verifier.gather_facts(repo, report) if repo else {"is_repo": False}
         det = verifier.deterministic_issues(facts, report, remote=not local)
         results, issues = drv2.parse_verify(
             judge.chat(drv2.build_verify_prompt(snap, report, verifier.facts_summary(facts), det),
@@ -1227,8 +1262,9 @@ class AutomationWorker(threading.Thread):
             self._log(f"🔎 [{app}] 已用 UIA 原文校正 OCR：{', '.join(fixed)}")
         # 4. 規則
         options = normalize_options(vs)
+        cmd_text = str(vs.get("command", "") or "")
         hit = check_deny(
-            [str(vs.get("command", "")), str(vs.get("pending_request", ""))] + [o["text"] for o in options],
+            [cmd_text or str(vs.get("pending_request", ""))] + [o["text"] for o in options],
             self.cfg.deny_patterns,
         )
         if hit:

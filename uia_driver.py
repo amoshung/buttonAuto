@@ -130,18 +130,43 @@ class UiaWindow:
         return None
 
     def panel_text(self, panel, max_chars: int = 4000) -> str:
+        """聊天面板的文字，依畫面順序。
+
+        Antigravity 會把一個段落拆成很多文字片段（每段行內程式碼各一個元件），所以同一個段落或列表項目內的
+        片段接在同一行，遇到新的區塊元件才換行。
+        """
         if panel is None:
             return ""
-        parts: List[str] = []
-        for c in _find_all(panel, auto.PropertyId.ControlTypeProperty, auto.ControlType.TextControl):
-            try:
-                t = (c.Name or "").strip()
-                if t and _visible(_rect(c)):
-                    parts.append(t)
-            except Exception:
-                continue
-        text = "\n".join(parts)
-        return text[-max_chars:]
+        lines: List[str] = []
+        cur: List[str] = []
+        text_depth = None  # 正在處理的文字元件深度；比它深的元件都屬於同一段文字
+
+        def flush() -> None:
+            line = re.sub(r"[ \t]+", " ", "".join(cur)).strip()
+            if line:
+                lines.append(line)
+            cur.clear()
+
+        try:
+            for c, depth in auto.WalkControl(panel, maxDepth=80):
+                ct = c.ControlTypeName
+                if ct == "TextControl":
+                    if text_depth is None or depth <= text_depth:
+                        text_depth = depth
+                    name = c.Name or ""
+                    if name:
+                        cur.append(name)
+                    continue
+                if text_depth is not None and depth > text_depth:
+                    continue
+                text_depth = None
+                if ct in ("ButtonControl", "ImageControl", "HyperlinkControl"):
+                    continue
+                flush()
+        except Exception:
+            pass
+        flush()
+        return "\n".join(lines)[-max_chars:]
 
 
 def pick_button(buttons: List[ButtonInfo], wanted: str, panel_rect: Optional[Rect] = None,

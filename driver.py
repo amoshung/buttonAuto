@@ -34,8 +34,15 @@ DOCS_QUESTION = "請判斷下列計畫文件中，哪些是目前正在進行的
 DOCS_ANSWER_FORMAT = "回答時每一份都寫出完整路徑，並標註「進行中」「已完成」或「過時」。"
 
 
+_VOLATILE = re.compile(
+    r"\b\d+\s*(s|m|h|d|sec|min|mins|hour|hours|day|days)\s+ago\b|\bjust now\b|"
+    r"Elapsed time:\s*[\d.]+\s*\w+|Est\. Credits Used:\s*[\d.]+|\d+\s*(秒|分鐘|小時|天)前|剛剛", re.I)
+
+
 def panel_hash(panel_text: str) -> str:
-    return hashlib.sha1((panel_text or "").encode("utf-8")).hexdigest()
+    """聊天內容的指紋。去掉「2m ago」「Elapsed time」這類會自己變的文字，畫面沒有新內容時指紋不變。"""
+    norm = _VOLATILE.sub("", panel_text or "")
+    return hashlib.sha1(re.sub(r"\s+", " ", norm).strip().encode("utf-8")).hexdigest()
 
 
 def doc_candidates(specs: Optional[List[Dict[str, Any]]] = None,

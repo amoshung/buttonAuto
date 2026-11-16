@@ -16,3 +16,5 @@ sessions/
 reports/
 # 本機狀態：勾選的工作階段、本機路徑、自訂目標清單
 config.json
+# 本機測試用暫存檔
+.tmp_*

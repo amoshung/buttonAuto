@@ -234,3 +234,11 @@ def test_observe_history_only_on_state_change(tmp_path):
     sess = w._session_for(pw)
     today = sess.load().updated_at[:10]
     assert [h["agent_state"] for h in sess.history_on(today) if h["kind"] == "observe"] == ["working"]
+
+
+def test_panel_hash_ignores_relative_timestamps():
+    a = "代理：完成了\n2m ago\nEst. Credits Used: 0.07 Elapsed time: 2s"
+    b = "代理：完成了\n5m ago\nEst. Credits Used: 0.07 Elapsed time: 2s"
+    c = "代理：完成了，另外還有一件事\n5m ago"
+    assert drv.panel_hash(a) == drv.panel_hash(b)
+    assert drv.panel_hash(a) != drv.panel_hash(c)

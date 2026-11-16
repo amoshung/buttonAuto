@@ -172,3 +172,16 @@ def test_config_blocks_plain_git_push_and_migrates(tmp_path):
     old.write_text(json.dumps({"deny_patterns": [r"\brm\s+-rf"]}), encoding="utf-8")
     loaded = AppConfig.load(str(old))
     assert r"git\s+push\b" in loaded.deny_patterns and r"\brm\s+-rf" in loaded.deny_patterns
+
+
+def test_parse_spec_lines_and_latest_segment():
+    sent = (drv2.SPEC_MARK + "請提出驗收條件\n格式（每條一行）：\n1. 條件：… | 驗證方式：… | 測試：…\n請直接貼在聊天裡。\n")
+    reply = ("好的，以下是驗收條件：\n"
+             "1. 條件：slugify 轉小寫 | 驗證方式：比對輸出 | 測試：test_lower；執行 pytest -q\n"
+             "2. 條件：合併連字號｜驗證方式：輸入 a--b 得到 a-b｜測試：test_dash\n"
+             "說明文字，不是條件\n")
+    seg = drv2.latest_spec_segment("舊對話\n" + sent + reply)
+    items = drv2.parse_spec_lines(seg)
+    assert [i["text"] for i in items] == ["slugify 轉小寫", "合併連字號"]
+    assert items[0]["test"] == "test_lower；執行 pytest -q" and items[1]["how"] == "輸入 a--b 得到 a-b"
+    assert drv2.parse_spec_lines(sent) == []  # 我們自己送出的格式範例不算

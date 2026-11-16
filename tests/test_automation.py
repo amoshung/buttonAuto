@@ -311,3 +311,12 @@ def test_config_new_fields_and_old_file_compat(tmp_path):
 
     old.write_text(json.dumps({"mode": "bogus"}), encoding="utf-8")
     assert AppConfig.load(str(old)).mode == "ai"
+
+
+def test_ai_never_clicks_always_allow():
+    cfg = AppConfig()
+    vs = {"action_buttons": ["Deny", "Allow", "Always allow"]}
+    p = decide_plan(vs, _answers("click_button", button="opt_2"), cfg, has_input=True)
+    assert p.kind == "click" and p.button == "Allow"  # 改點一次性的 Allow
+    only_always = {"action_buttons": ["Always allow"]}
+    assert decide_plan(only_always, _answers("click_button", button="opt_0"), cfg, True).kind == "ask_human"

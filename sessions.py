@@ -86,6 +86,8 @@ class SessionState:
     sends_in_conversation: int = 0
     recent_tails: List[str] = field(default_factory=list)
     rollovers: int = 0
+    # 查核用的 git repo（專案根目錄不是 repo、實作在子資料夾時指定）；空字串代表用專案路徑
+    repo_path: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionState":

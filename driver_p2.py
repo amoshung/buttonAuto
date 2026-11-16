@@ -56,6 +56,37 @@ def build_spec_extract_prompt(text: str, goal: str) -> str:
     )
 
 
+_SPEC_LINE = re.compile(r"條件\s*[:：]\s*(?P<text>.+?)\s*[|｜]\s*驗證方式\s*[:：]\s*(?P<how>.+?)"
+                        r"\s*[|｜]\s*測試\s*[:：]\s*(?P<test>.+)")
+_PLACEHOLDER = re.compile(r"^[.…·\s]*$")
+
+
+def latest_spec_segment(text: str) -> str:
+    """只取最後一次「【驗收 spec】」訊息之後的內容（代理的最新回覆），避免把我們自己送出的格式範例當成條件。"""
+    i = (text or "").rfind(SPEC_MARK)
+    if i < 0:
+        return text or ""
+    rest = text[i:]
+    j = rest.find("\n", rest.find("條件：… | 驗證方式：… | 測試：…") + 1) if "條件：… | 驗證方式：… | 測試：…" in rest else 0
+    return rest[j:] if j > 0 else rest
+
+
+def parse_spec_lines(text: str) -> List[Dict[str, str]]:
+    """直接解析「條件：… | 驗證方式：… | 測試：…」格式（不經模型，不會被截斷）。"""
+    out: List[Dict[str, str]] = []
+    for line in (text or "").splitlines():
+        m = _SPEC_LINE.search(line)
+        if not m:
+            continue
+        item = {k: m.group(k).strip().strip("|｜ ").strip()[:300] for k in ("text", "how", "test")}
+        if _PLACEHOLDER.match(item["text"]) or _PLACEHOLDER.match(item["how"]):
+            continue
+        item["status"] = "todo"
+        if not any(x["text"] == item["text"] for x in out):
+            out.append(item)
+    return out[:40]
+
+
 def parse_spec_items(raw: str) -> List[Dict[str, str]]:
     obj = extract_json(raw) or {}
     items = obj.get("items") if isinstance(obj.get("items"), list) else []
@@ -68,7 +99,7 @@ def parse_spec_items(raw: str) -> List[Dict[str, str]]:
             continue
         out.append({"text": text[:300], "how": str(it.get("how") or "").strip()[:300],
                     "test": str(it.get("test") or "").strip()[:300], "status": "todo"})
-    return out[:30]
+    return out[:40]
 
 
 def build_spec_review_prompt(goal: str, items: List[Dict[str, str]]) -> str:
