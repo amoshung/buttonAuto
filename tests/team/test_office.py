@@ -511,7 +511,7 @@ def test_delegate_runner_exit_error_retries_once_then_hands_off(tmp_path, envs):
     envs.append(env)
     r = create_demo_room(env.office, str(tmp_path))
     env.office.set_delegate(r.id, True)
-    shutil.rmtree(os.path.join(r.repo, ".git"))  # 不再是 git repo → 執行器 _Fatal → 錯誤項目
+    os.rename(os.path.join(r.repo, ".git"), os.path.join(r.repo, ".notgit"))  # 不再是 git repo → 執行器 _Fatal → 錯誤項目
     seen = []
     real = env.office._runner_exited
 
