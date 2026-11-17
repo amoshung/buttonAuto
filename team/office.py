@@ -20,7 +20,7 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from team import gitops, notes, personas, policy
+from team import gitops, notes, personas, policy, prompts
 from team.clis import CliInfo, discover
 from team.drivers import GLM_SEATS, make_driver, seat_launch
 from team.fleet import SEAT_LABELS, SEATS, Dispatcher, QuotaBook
@@ -128,6 +128,8 @@ class Office:
         self._detect_drivers = {}  # type: Dict[str, Any]  # 偵測中的驅動（stop() 時關掉）
         # Task 17：所有模型呼叫與 CLI 回合的用量帳（sessions/team/usage-YYYYMMDD.jsonl；示範房只在記憶體）
         self.usage = UsageBook(os.path.join(store.root, "usage.jsonl"))
+        # Task 7：角色提示詞三層儲存
+        self.prompts = prompts.PromptStore(store.root)
         # 登入：注入的 launcher／checker 給測試用（示範房與真座位都用它）；沒注入時示範房不開視窗、視為已登入
         self.login_launcher = login_launcher
         self.login_checker = login_checker

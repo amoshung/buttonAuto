@@ -507,3 +507,17 @@ def test_legacy_docs_api(srv, tmp_path):
     assert not os.path.exists(os.path.join(repo, "docs", "ai-team"))
     assert J(srv, "/api/team/legacy_docs")[1]["repos"] == []
 
+
+def test_prompts_api_get_save_reset(srv):
+    code, v = J(srv, "/api/team/prompts")
+    assert code == 200 and "qa" in v["roles"] and v["roles"]["qa"]["version"] == "default"
+    code, bad = J(srv, "/api/team/prompts", {"role": "qa", "scope": "global", "sections": {"principles": "看 {unknown_ph}"}})
+    assert code == 200 and bad["ok"] is False and "unknown_ph" in bad["text"]
+    code, saved = J(srv, "/api/team/prompts", {"role": "qa", "scope": "global", "sections": {"principles": "新原則 {goal}"}})
+    assert code == 200 and saved["ok"] is True and saved["version"] == "global:v1"
+    code, rst = J(srv, "/api/team/prompts/reset", {"role": "qa", "scope": "global"})
+    assert code == 200 and rst["ok"] is True and rst["prompts"]["roles"]["qa"]["version"] == "default"
+    raw = json.dumps(rst, ensure_ascii=False)
+    assert GLM_KEY not in raw and D1_KEY not in raw
+
+

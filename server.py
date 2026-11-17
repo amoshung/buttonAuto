@@ -421,6 +421,25 @@ class AssistantServer:
                 if found:
                     repos.append({"repo": r, "dirs": found})
             return {"repos": repos}
+        if path == "/api/team/prompts":
+            rid = arg("room").strip()
+            if rid:
+                self._team_room(rid)
+            return t.prompts.view(rid)
+        if path == "/api/team/prompts/preview":
+            from team import personas
+            role = arg("role").strip()
+            rid = arg("room").strip()
+            if role not in t.prompts.view()["roles"]:
+                raise TeamError(400, "不認得的角色：%s" % role)
+            room = self._team_room(rid) if rid else None
+            comp = personas.Composer(
+                t.prompts,
+                room.id if room else "",
+                notes_dir=(room.notes_dir if room and room.notes_dir else "<notes_dir>"),
+            )
+            p = comp.preview(role, room)
+            return {"ok": True, "role": role, "version": p.version, "text": p.text}
         return None
 
     def _team_room(self, room_id: str):
@@ -563,6 +582,56 @@ class AssistantServer:
             moved = notes.remove_legacy_in_repo(repo, self.cfg.team_legacy_doc_list())
             text = ("已移除舊助理文件：%s" % "、".join(moved)) if moved else "沒有發現舊的助理文件"
             return {"ok": True, "text": text, "moved": moved}
+        if path == "/api/team/prompts":
+            role = self._need(body, "role").strip()
+            scope = str(body.get("scope") or "global").strip()
+            room_id = str(body.get("room_id") or "").strip()
+            if scope == "room":
+                self._team_room(room_id)
+            sections = body.get("sections")
+            if not isinstance(sections, dict):
+                raise TeamError(400, "缺少 sections 物件")
+            try:
+                ver = t.prompts.save(role, sections, scope, room_id=room_id, note=str(body.get("note") or ""))
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+            self.hub.bump()
+            return {"ok": True, "version": ver, "text": "已儲存提示詞（%s）" % ver, "prompts": t.prompts.view(room_id)}
+        if path == "/api/team/prompts/reset":
+            role = self._need(body, "role").strip()
+            scope = str(body.get("scope") or "global").strip()
+            room_id = str(body.get("room_id") or "").strip()
+            if scope == "room":
+                self._team_room(room_id)
+            try:
+                t.prompts.reset(role, scope, room_id=room_id)
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+            self.hub.bump()
+            return {"ok": True, "text": "已回復預設", "prompts": t.prompts.view(room_id)}
+        if path == "/api/team/prompts/restore":
+            role = self._need(body, "role").strip()
+            scope = str(body.get("scope") or "global").strip()
+            version = self._need(body, "version").strip()
+            room_id = str(body.get("room_id") or "").strip()
+            if scope == "room":
+                self._team_room(room_id)
+            try:
+                ver = t.prompts.restore(role, scope, version, room_id=room_id)
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+            self.hub.bump()
+            return {"ok": True, "version": ver, "text": "已回復到 %s" % ver, "prompts": t.prompts.view(room_id)}
+        if path == "/api/team/prompts/promote":
+            role = self._need(body, "role").strip()
+            room_id = self._need(body, "room_id").strip()
+            self._team_room(room_id)
+            try:
+                ver = t.prompts.promote(role, room_id)
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+            self.hub.bump()
+            return {"ok": True, "version": ver, "text": "已升為全域（%s）" % ver, "prompts": t.prompts.view(room_id)}
         return None
 
     def _watch_code(self) -> None:
