@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="aea-token" content="__TOKEN__">
+<title>AI 工程助理</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/office.css">
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <div class="brand"><b>AI 工程助理</b><small id="ver"></small></div>
+    <div class="run" id="run">
+      <span class="lamp" aria-hidden="true"></span>
+      <div><div class="what" id="run-what" aria-live="polite">連線中…</div><div class="sub" id="run-sub"></div></div>
+      <button class="btn big" id="run-btn" type="button" title="暫停所有運作中與排隊的房間">全部暫停 <kbd>F8</kbd></button>
+    </div>
+    <div class="chips">
+      <button class="chip" id="chip-notify" type="button">瀏覽器通知</button>
+      <button class="chip" id="chip-palette" type="button" title="Ctrl+K">指令 Ctrl+K</button>
+      <span class="chip conn" id="conn">連線中…</span>
+    </div>
+  </header>
+  <div class="banner hidden" id="banner" role="status"></div>
+  <nav class="nav" aria-label="主要">
+    <button type="button" data-view="office">辦公室 <span class="count hidden"></span></button>
+    <button type="button" data-view="logs">日誌</button>
+    <hr>
+    <button type="button" data-view="settings">設定</button>
+    <div class="foot">在這個頁面按 F8 全部暫停。<br>只綁 127.0.0.1。</div>
+  </nav>
+  <main id="main" tabindex="-1"></main>
+</div>
+<div id="drawer-root"></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script src="/static/office-scene.js"></script>
+<script src="/static/office.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

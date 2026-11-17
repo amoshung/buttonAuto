@@ -18,3 +18,17 @@ reports/
 config.json
 # 本機測試用暫存檔
 .tmp_*
+
+# 網頁主控台執行期檔案（存取碼、PID／連接埠、框選暫存）
+runtime.local.json
+web_token.local
+.capture_*.json
+recon/
+litellm.local.json
+# 使用者在主控台選的座位模型（本機設定）
+team_models.json
+.superpowers/
+# Serena MCP 的專案快取（工具產生，勿提交）
+.serena/
+# 使用者在主控台框選的目標截圖（本機狀態）
+targets/custom_*.png

@@ -473,6 +473,23 @@ def input_has_draft(control) -> bool:
     return False
 
 
+def set_value(control, text: str) -> bool:
+    """不搶焦點、不用鍵盤：用 UIA ValuePattern 直接把文字放進輸入框（背景輸入）。
+
+    輸入框不支援 ValuePattern 或是唯讀時回傳 False，呼叫端要改用一般的「切到前景＋貼上」。
+    Chromium 對 contenteditable（Kiro 的 ProseMirror）實作 SetValue 時會改寫 DOM，編輯器再從 DOM 變化讀回內容；
+    結果是否真的被編輯器接受，要由呼叫端用 input_text／送出鈕是否可按來核對，不能只看這裡的回傳值。
+    """
+    try:
+        vp = control.GetPattern(auto.PatternId.ValuePattern)
+        if not vp or bool(getattr(vp, "IsReadOnly", False)):
+            return False
+        vp.SetValue(text)
+        return True
+    except Exception:
+        return False
+
+
 def control_rect(control) -> Optional[Rect]:
     try:
         return _rect(control)
