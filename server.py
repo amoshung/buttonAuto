@@ -412,6 +412,15 @@ class AssistantServer:
             return t.usage_summary()
         if path == "/api/team/models":
             return t.models_view()
+        if path == "/api/team/legacy_docs":
+            from team import notes
+            dirs = self.cfg.team_legacy_doc_list()
+            repos = []
+            for r in self.team_known_repos():
+                found = notes.legacy_in_repo(r, dirs)
+                if found:
+                    repos.append({"repo": r, "dirs": found})
+            return {"repos": repos}
         return None
 
     def _team_room(self, room_id: str):
@@ -543,6 +552,17 @@ class AssistantServer:
                 return {"ok": True, "text": "已開始試探" if started else "這個座位正在試探中"}
             t.reset_seat(seat)
             return {"ok": True, "text": "已標為可用"}
+        if path == "/api/team/legacy_docs/remove":
+            from team import notes
+            repo = self._need(body, "repo").strip()
+            bad = local_path_problem(repo)
+            if bad:
+                raise TeamError(400, bad)
+            if not os.path.isdir(repo):
+                return {"ok": False, "text": "找不到資料夾：%s" % repo, "moved": []}
+            moved = notes.remove_legacy_in_repo(repo, self.cfg.team_legacy_doc_list())
+            text = ("已移除舊助理文件：%s" % "、".join(moved)) if moved else "沒有發現舊的助理文件"
+            return {"ok": True, "text": text, "moved": moved}
         return None
 
     def _watch_code(self) -> None:

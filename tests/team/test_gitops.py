@@ -86,7 +86,7 @@ def test_create_failure_leaves_nothing(tmp_path):
 def test_outside_allowed():
     assert gitops.outside_allowed(["src/a.py", "tests/t.py", "x.md"], ["src/", "tests/*.py"]) == ["x.md"]
     assert gitops.outside_allowed(["x.md"], []) == []
-    assert gitops.outside_allowed(["docs/ai-team/s/spec.md", "y"], ["src/"]) == ["y"]
+    assert gitops.outside_allowed(["docs/ai-team/s/spec.md", "y"], ["src/"]) == ["docs/ai-team/s/spec.md", "y"]
 
 
 def test_merge(repo):

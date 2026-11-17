@@ -16,7 +16,7 @@ from typing import List, Tuple
 # 助理自己的 commit／merge：不簽章（使用者若設了 commit.gpgsign，沒有金鑰或 pinentry 會卡住或失敗）
 IDENTITY = ["-c", "user.name=ai-team", "-c", "user.email=ai-team@local", "-c", "commit.gpgsign=false"]
 WORKTREE_ADD_TIMEOUT = 900  # 大 repo checkout（加上防毒掃描）可能要好幾分鐘
-ALWAYS_ALLOWED = "docs/ai-team/"
+LEGACY_DOC_DIRS = ["docs/ai-team"]
 WT_DIR = ".ai-team-worktrees"
 
 
@@ -194,7 +194,12 @@ def uncommitted(wt: Worktree) -> List[str]:
 
 def changed_files(wt: Worktree) -> List[str]:
     committed = _lines(git(wt.path, "diff", "--no-renames", "--name-only", "-z", wt.base + "..HEAD"), "\0")
-    return sorted(set(committed) | set(uncommitted(wt)))
+    all_files = sorted(set(committed) | set(uncommitted(wt)))
+    prefixes = tuple(d.strip("/") + "/" for d in LEGACY_DOC_DIRS)
+    return [
+        f for f in all_files
+        if not (f.replace("\\", "/").startswith(prefixes) and not os.path.exists(os.path.join(wt.path, f)))
+    ]
 
 
 def commits_since(wt: Worktree) -> List[Tuple[str, str]]:
@@ -202,6 +207,8 @@ def commits_since(wt: Worktree) -> List[Tuple[str, str]]:
     res = []
     for line in _lines(out):
         sha, _, subj = line.partition("\t")
+        if subj == "ai-team: 移除助理工作文件":
+            continue
         res.append((sha, subj))
     return res
 
@@ -212,8 +219,6 @@ def outside_allowed(files: List[str], allowed: List[str]) -> List[str]:
     out = []
     for f in files:
         f = f.replace("\\", "/")
-        if f.startswith(ALWAYS_ALLOWED):
-            continue
         ok = False
         for a in (x.replace("\\", "/") for x in allowed):
             if a.endswith("/"):

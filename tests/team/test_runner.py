@@ -21,7 +21,7 @@ PY = sys.executable
 SECRET = "sk-secret-glm-key-777"
 D1_SECRET = "sk-secret-d1-key-888"
 SLUG = "add-mul"
-DOCS = "docs/ai-team/%s" % SLUG
+DOCS = "../proj-%s.notes" % SLUG
 
 CALC_ADD = "def add(a, b):\n    return a + b\n"
 TEST_ADD = "from calc import add\n\n\ndef test_add():\n    assert add(1, 2) == 3\n"
@@ -39,7 +39,7 @@ SPEC = {
 }
 SPEC_TURN = [{"say": "我讀完專案了。\n```json\n%s\n```" % json.dumps(SPEC, ensure_ascii=False)}]
 PLAN_TURN = [{"write": {"path": DOCS + "/plan.md", "content": "# 計畫\n1. 加入 mul 與測試（對應 C1）\n"}},
-             {"commit": "plan"}, {"say": "DONE"}]
+             {"say": "DONE"}]
 SAFE_TOOL = {"tool": {"title": "跑測試", "kind": "execute",
                       "rawInput": {"command": "python -m pytest -q"}}}
 BUILD_TURN = [{"write": {"path": "calc.py", "content": CALC_MUL}},
@@ -151,10 +151,12 @@ def test_happy_path_reaches_done(tmp_path, repo):
     assert [o["id"] for o in merges[0].options] == ["merge", "later"]
     assert "C1: mul" in merges[0].detail and "calc.py" in merges[0].detail
     wt = room.worktree
-    assert os.path.isfile(os.path.join(wt, DOCS, "evidence.md"))
-    assert os.path.isfile(os.path.join(wt, DOCS, "spec.md"))
+    assert not os.path.exists(os.path.join(wt, "docs", "ai-team"))
+    assert os.path.isfile(os.path.join(room.notes_dir, "evidence.md"))
+    assert os.path.isfile(os.path.join(room.notes_dir, "spec.md"))
+    assert os.path.isfile(os.path.join(room.notes_dir, "plan.md"))
     log = git(wt, "log", "--format=%an %s")
-    assert "ai-team ai-team: spec" in log and "ai-team ai-team: evidence" in log
+    assert "ai-team: spec" not in log and "ai-team: evidence" not in log
     assert git(wt, "status", "--porcelain").strip() == ""
     assert room.criteria[0]["id"] == "C1" and room.allowed_paths == ["calc.py", "test_calc.py"]
     assert room.base and room.branch == "ai-team/" + SLUG and room.target_branch == "main"
@@ -351,7 +353,7 @@ def test_restore_at_phase_boundary(tmp_path, repo):
 
 def test_rollover_at_70_percent(tmp_path, repo):
     plan = PLAN_TURN[:-1] + [{"usage": {"used": 150000, "size": 200000}}, {"say": "DONE"}]
-    save = [{"write": {"path": DOCS + "/progress.md", "content": PROGRESS}}, {"commit": "progress"},
+    save = [{"write": {"path": DOCS + "/progress.md", "content": PROGRESS}},
             {"say": "DONE"}]
     build = [{"echo_prompt": True}] + BUILD_TURN
     env = Env(tmp_path, repo, [SPEC_TURN, plan, save, build])
@@ -364,7 +366,7 @@ def test_rollover_at_70_percent(tmp_path, repo):
     assert "progress.md" in first_prompt["text"]
     assert any("progress.md" in e["text"] for e in ev[ro[0]:] if e["kind"] == "agent")
     assert room.rollovers == 1
-    assert "## 下一步" in git(room.worktree, "show", "%s:%s/progress.md" % (room.branch, DOCS))
+    assert "## 下一步" in open(os.path.join(room.notes_dir, "progress.md"), encoding="utf-8").read()
     assert not any("代寫" in t for t in env.texts())
 
 
@@ -374,10 +376,10 @@ def test_rollover_writes_progress_when_agent_doesnt(tmp_path, repo):
     room = env.run()
     assert room.status == "done", room.error
     assert any("代寫" in t for t in env.texts())
-    text = git(room.worktree, "show", "%s:%s/progress.md" % (room.branch, DOCS))
+    text = open(os.path.join(room.notes_dir, "progress.md"), encoding="utf-8").read()
     for s in SECTIONS:
         assert "## " + s in text
-    assert "ai-team: progress" in git(room.worktree, "log", "--format=%s")
+    assert "ai-team: progress" not in git(room.worktree, "log", "--format=%s")
 
 
 def test_context_fraction():
@@ -783,13 +785,15 @@ def test_commit_docs_skips_hooks_and_gpgsign(tmp_path, repo):
     import types
     env = Env(tmp_path, repo, [[{"say": "x"}]])
     r = env.runner
-    r._wt = types.SimpleNamespace(path=str(repo), base="HEAD")
+    r._wt = types.SimpleNamespace(path=str(repo), base="HEAD", repo=str(repo), branch="ai-team/add-mul")
     hook = repo / ".git" / "hooks" / "pre-commit"
     hook.write_text("#!/bin/sh\nexit 1\n")
     os.chmod(hook, 0o755)
     git(repo, "config", "commit.gpgsign", "true")
     git(repo, "config", "gpg.program", "false")
-    r._write_doc("docs/ai-team/x/spec.md", "# x\n")
+    legacy = repo / "docs" / "ai-team" / "x" / "spec.md"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text("# x\n", encoding="utf-8")
     r._commit_docs("docs/ai-team/x", "ai-team: spec")
     log = subprocess.run(["git", "log", "-1", "--format=%an %s"], cwd=repo, capture_output=True, text=True).stdout
     assert log.strip() == "ai-team ai-team: spec"

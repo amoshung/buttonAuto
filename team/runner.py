@@ -32,7 +32,7 @@ import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from team import gitops, netcerts, personas, policy
+from team import gitops, netcerts, notes, personas, policy
 from team.acp import AcpError
 from team.checks import build_issues, deny_issue, git_problem, test_gate
 from team.clis import CliInfo
@@ -395,9 +395,12 @@ class RoomRunner(threading.Thread):
         except GitError as e:
             raise _Fatal(str(e))
         self._wt = wt
+        cand = wt.branch.split("/", 1)[-1] if "/" in wt.branch else r.slug
+        nd = r.notes_dir or notes.notes_dir(r.repo, cand)
         self._set(worktree=wt.path, branch=wt.branch, base=r.base or wt.base,
-                  target_branch=r.target_branch or wt.target_branch)
+                  target_branch=r.target_branch or wt.target_branch, notes_dir=nd)
         self._event("worktree", "工作目錄：%s（分支 %s）" % (wt.path, wt.branch))
+        self._purge_notes()
         if self.room.phase == "done":
             self._set(status="done", persona="", activity="全部關卡通過，等你合併")
             return
@@ -1462,26 +1465,45 @@ class RoomRunner(threading.Thread):
         if frac >= self.context_rollover:
             self._need_rollover = True
 
+    def _notes_dir(self) -> str:
+        r = self.room
+        if r and r.notes_dir:
+            os.makedirs(r.notes_dir, exist_ok=True)
+            return r.notes_dir
+        if self._wt is not None:
+            branch = getattr(self._wt, "branch", "") or ""
+            repo = getattr(self._wt, "repo", "") or (r.repo if r else "") or getattr(self._wt, "path", "")
+            cand = branch.split("/", 1)[-1] if "/" in branch else (r.slug if r else "task")
+            return notes.notes_dir(repo, cand)
+        return notes.notes_dir(r.repo, r.slug)
+
+    def _purge_notes(self) -> None:
+        if self._wt is None or not getattr(self._wt, "path", ""):
+            return
+        nd = self._notes_dir()
+        removed = notes.purge_worktree(self._wt, nd)
+        for p in removed:
+            self._event("notes_purge", "移除助理工作文件：%s" % p, path=p)
+        try:
+            notes.mirror(nd, self.store._dir(self.room_id))
+        except Exception:
+            pass
+
     def _progress_rel(self) -> str:
-        return "docs/ai-team/%s/progress.md" % self.room.slug
+        return "progress.md"
 
     def _progress_blob(self) -> str:
+        path = os.path.join(self._notes_dir(), self._progress_rel())
         try:
-            return gitops.git(self._wt.path, "rev-parse", "-q", "--verify", "HEAD:" + self._progress_rel()).strip()
-        except GitError:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except OSError:
             return ""
 
     def _progress_ok(self, before: str) -> bool:
-        """分支 HEAD 上的 progress.md 比存檔前新、內容有全部章節，而且沒有未提交的改動。"""
-        rel = self._progress_rel()
-        after = self._progress_blob()
-        if not after or after == before:
-            return False
-        try:
-            if gitops.git(self._wt.path, "status", "--porcelain", "--", rel).strip():
-                return False
-            text = gitops.git(self._wt.path, "show", "HEAD:" + rel)
-        except GitError:
+        """notes 目錄裡的 progress.md 比存檔前新，且內容有全部章節。"""
+        text = self._progress_blob()
+        if not text or text == before:
             return False
         return all(re.search(r"^#+\s*%s\s*$" % re.escape(s), text, re.M) for s in personas.PROGRESS_SECTIONS)
 
@@ -1492,14 +1514,15 @@ class RoomRunner(threading.Thread):
         except GitError:
             commits = "（無法讀取）"
         open_items = [i.title for i in self._room_items(("question", "approve_spec", "unverified", "permission"))]
+        nd = self._notes_dir()
         body = {
             "目標": r.goal,
             "驗收條件狀態": "\n".join("- %s %s（檢查：%s）" % (c.get("id"), c.get("text"), c.get("check") or "manual")
                                 for c in r.criteria or []) or "（尚無）",
             "已完成（commit）": commits,
             "正在做": "階段：%s；%s" % (r.phase, r.activity or ""),
-            "下一步": "先讀 docs/ai-team/%s/spec.md 與 plan.md，依計畫完成尚未通過的條件；測試指令：%s"
-                    % (r.slug, r.test_cmd or "（未定）"),
+            "下一步": "先讀 %s/spec.md 與 plan.md，依計畫完成尚未通過的條件；測試指令：%s"
+                    % (nd, r.test_cmd or "（未定）"),
             "未決問題": "\n".join("- " + t for t in open_items) or "（無）",
             "注意事項": "代理未存檔，由助理依紀錄代寫。只改允許範圍：%s"
                     % ("、".join(r.allowed_paths) if r.allowed_paths else "整個 repo"),
@@ -1507,7 +1530,6 @@ class RoomRunner(threading.Thread):
         text = "# 進度（%s）\n\n" % r.slug + "".join(
             "## %s\n%s\n\n" % (s, body[s]) for s in personas.PROGRESS_SECTIONS)
         self._write_doc(self._progress_rel(), text)
-        self._commit_docs(self._progress_rel(), "ai-team: progress")
 
     def _rollover(self) -> None:
         self._need_rollover = False
@@ -1524,9 +1546,10 @@ class RoomRunner(threading.Thread):
             except _TurnFailed as e:
                 self._event("notice", "存檔回合失敗：%s" % e.text[:300])
         self._check_pause()
+        self._purge_notes()
         if not self._progress_ok(before):
             self._write_progress()
-            self._event("notice", "代理未存檔，由助理代寫 %s 並 commit" % self._progress_rel())
+            self._event("notice", "代理未存檔，由助理代寫 %s" % self._progress_rel())
         old = self._impl
         with self._lock:
             self._impl = None
@@ -1553,13 +1576,18 @@ class RoomRunner(threading.Thread):
 
     # ================= 文件 =================
     def _doc_rel(self, name: str) -> str:
-        return "docs/ai-team/%s/%s" % (self.room.slug, name)
+        return os.path.basename(name)
 
     def _write_doc(self, rel: str, text: str) -> None:
-        full = os.path.join(self._wt.path, rel)
+        nd = self._notes_dir()
+        full = os.path.join(nd, os.path.basename(rel))
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
+        try:
+            notes.mirror(nd, self.store._dir(self.room_id))
+        except Exception:
+            pass
 
     def _commit_docs(self, pathspec: str, msg: str) -> None:
         wt = self._wt.path
@@ -1701,7 +1729,6 @@ class RoomRunner(threading.Thread):
         for a in self._spec_alerts() + self._spec_notes():
             self._event("notice", a)
         self._write_doc(self._doc_rel("spec.md"), self._spec_md())
-        self._commit_docs("docs/ai-team/%s" % self.room.slug, "ai-team: spec")
         self._event("spec", "驗收條件 %d 條；測試指令：%s" % (len(spec["criteria"]), spec["test_cmd"]))
 
     def _spec_md(self) -> str:
@@ -1782,7 +1809,7 @@ class RoomRunner(threading.Thread):
 
     # ================= 計畫（Tech Lead） =================
     def _plan_missing(self) -> List[str]:
-        path = os.path.join(self._wt.path, self._doc_rel("plan.md"))
+        path = os.path.join(self._notes_dir(), self._doc_rel("plan.md"))
         try:
             with open(path, encoding="utf-8") as f:
                 text = f.read()
@@ -1793,6 +1820,7 @@ class RoomRunner(threading.Thread):
 
     def _plan(self) -> None:
         self._phase("plan", "spec", "tech_lead", "Tech Lead 寫實作計畫")
+        self._purge_notes()
         if not self._plan_missing():
             self._event("notice", "計畫已涵蓋所有驗收條件")
             return
@@ -1800,6 +1828,7 @@ class RoomRunner(threading.Thread):
         fixes = 0
         while True:
             self._impl_turn("tech_lead", text)
+            self._purge_notes()
             issues = self._plan_missing()
             if not issues:
                 return
@@ -1874,6 +1903,7 @@ class RoomRunner(threading.Thread):
     def _test(self) -> Optional[str]:
         """通過回 None；不通過回要送給代理的修正提示。"""
         self._phase("test", "test", "qa", "QA 在 worktree 跑測試")
+        self._purge_notes()
         r = self.room
         gate = test_gate(self._wt, r.test_cmd, r.criteria, cancel=self._pause_ev,
                          deny_patterns=self.deny_patterns)
@@ -1940,7 +1970,6 @@ class RoomRunner(threading.Thread):
             lines += ["## %s" % UNCHECKED, "這些條件沒有可執行的檢查指令，助理無法驗證，合併前請你自己確認：%s"
                       % "、".join(manual), ""]
         self._write_doc(self._doc_rel("evidence.md"), "\n".join(lines))
-        self._commit_docs(self._doc_rel("evidence.md"), "ai-team: evidence")
 
     # ================= review（Reviewer） =================
     def _review_stage(self) -> Optional[str]:
@@ -2058,9 +2087,10 @@ class RoomRunner(threading.Thread):
         self._suggestions = sugg
 
     def _finish(self) -> None:
+        self._purge_notes()
         sugg = self._suggestions
         rel = self._doc_rel("evidence.md")
-        full = os.path.join(self._wt.path, rel)
+        full = os.path.join(self._notes_dir(), rel)
         try:
             with open(full, encoding="utf-8") as f:
                 ev = f.read()
@@ -2069,7 +2099,6 @@ class RoomRunner(threading.Thread):
         ev += "\n## 審查\n- 審查座位：%s\n- 必須修正：無\n%s\n" % (
             _label(self.room.review_seat), "".join("- 建議：%s\n" % s for s in sugg))
         self._write_doc(rel, ev)
-        self._commit_docs(rel, "ai-team: review")
         commits = "\n".join("%s %s" % c for c in gitops.commits_since(self._wt))
         stat = gitops.diff_stat(self._wt)
         manual = _unchecked_ids(self.room.criteria)

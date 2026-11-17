@@ -490,3 +490,20 @@ def test_room_delegate_endpoint(srv):
     assert {"你開啟代管", "你關閉代管"} <= {e["text"] for e in ev if e["kind"] == "delegate"}
     raw = json.dumps(ev, ensure_ascii=False)
     assert GLM_KEY not in raw and D1_KEY not in raw
+
+
+def test_legacy_docs_api(srv, tmp_path):
+    repo = str(tmp_path / "repo_legacy")
+    git_repo(repo)
+    old = os.path.join(repo, "docs", "ai-team", "s", "spec.md")
+    os.makedirs(os.path.dirname(old), exist_ok=True)
+    with open(old, "w", encoding="utf-8") as f:
+        f.write("# old")
+    srv.team.store.create(name="p", repo=repo, slug="s", goal="g", source="goal", impl_cli="auto", review_cli="auto")
+    code, res = J(srv, "/api/team/legacy_docs")
+    assert code == 200 and {"repo": repo, "dirs": ["docs/ai-team"]} in res["repos"]
+    code, rm = J(srv, "/api/team/legacy_docs/remove", {"repo": repo})
+    assert code == 200 and rm["ok"] is True and rm["moved"] == ["docs/ai-team"]
+    assert not os.path.exists(os.path.join(repo, "docs", "ai-team"))
+    assert J(srv, "/api/team/legacy_docs")[1]["repos"] == []
+

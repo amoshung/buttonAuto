@@ -20,7 +20,7 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from team import gitops, personas, policy
+from team import gitops, notes, personas, policy
 from team.clis import CliInfo, discover
 from team.drivers import GLM_SEATS, make_driver, seat_launch
 from team.fleet import SEAT_LABELS, SEATS, Dispatcher, QuotaBook
@@ -846,6 +846,9 @@ class Office:
             r = self._alive(rid)
         wt = Worktree(room.repo, room.worktree, room.branch, room.base, room.target_branch)
         try:
+            nd = room.notes_dir or notes.notes_dir(room.repo, room.slug)
+            for p in notes.purge_worktree(wt, nd):
+                self._event(rid, "notes_purge", "移除助理工作文件：%s" % p, path=p)
             sha = gitops.merge_into_repo(wt)
         except GitError as e:
             self._event(rid, "notice", "合併失敗：%s" % e)
