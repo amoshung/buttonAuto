@@ -223,3 +223,49 @@ def test_list_and_inbox_ignore_other_files_in_root(tmp_path):
     assert [r.id for r in s.list()] == [a.id]
     it = s.add_inbox(a.id, "question", "q", "d", [])
     assert [i.id for i in s.inbox()] == [it.id]
+
+
+def test_new_fields_roundtrip(tmp_path):
+    s = RoomStore(str(tmp_path))
+    r = s.create(name="p", repo="x", slug="s", goal="g", source="goal", impl_cli="auto", review_cli="auto")
+    s.update(r.id, lambda x: (setattr(x, "rounds", [{"n": 1}]), setattr(x, "ladder", {"level": "L2", "idle": 1})))
+    r2 = RoomStore(str(tmp_path)).get(r.id)
+    assert r2.rounds == [{"n": 1}] and r2.ladder["level"] == "L2" and r2.capabilities is None
+    assert r2.budget == {} and r2.spent == {} and r2.baseline == {} and r2.env_accepted == []
+    assert r2.user_info == "" and r2.notes_dir == "" and r2.caps_loaded == {}
+    assert r2.lessons_used == [] and r2.autotune == {} and r2.stuck_reason == ""
+
+
+def test_old_room_json_loads(tmp_path):
+    s = RoomStore(str(tmp_path))
+    r = mk(s)
+    p = os.path.join(str(tmp_path), r.id, "room.json")
+    d = json.load(open(p, encoding="utf-8"))
+    for k in ("rounds", "ladder", "budget", "spent", "baseline", "env_accepted",
+              "user_info", "notes_dir", "capabilities", "caps_loaded",
+              "lessons_used", "autotune", "stuck_reason"):
+        d.pop(k, None)
+    json.dump(d, open(p, "w", encoding="utf-8"))
+    r2 = s.get(r.id)
+    assert r2.rounds == [] and r2.budget == {} and r2.capabilities is None
+
+
+def test_recover_keeps_stuck(tmp_path):
+    s = RoomStore(str(tmp_path))
+    a = mk(s)
+    s.update(a.id, lambda r: (setattr(r, "status", "stuck"), setattr(r, "stuck_reason", "方法用盡")))
+    ids = s.recover_after_restart()
+    assert a.id not in ids
+    assert s.get(a.id).status == "stuck" and s.get(a.id).stuck_reason == "方法用盡"
+
+
+def test_stuck_and_recommend_inbox_kinds(tmp_path):
+    assert "stuck" in rooms.STATUSES
+    assert "stuck" in rooms.INBOX_KINDS and "recommend" in rooms.INBOX_KINDS
+    s = RoomStore(str(tmp_path))
+    a = mk(s)
+    i1 = s.add_inbox(a.id, "stuck", "停下", "細節", [{"id": "archive", "label": "封存房間"}])
+    i2 = s.add_inbox(a.id, "recommend", "推薦能力", "細節", [{"id": "ignore", "label": "忽略"}])
+    assert [i.kind for i in s.inbox()] == ["stuck", "recommend"]
+    assert i1.id and i2.id
+

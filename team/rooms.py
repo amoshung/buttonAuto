@@ -13,8 +13,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 log = logging.getLogger(__name__)
 
 PHASES = ["goal", "spec", "build", "test", "review", "done"]
-STATUSES = ["queued", "running", "waiting_user", "paused", "error", "done", "archived"]
-INBOX_KINDS = ["approve_spec", "permission", "question", "merge", "error", "unverified", "login"]
+STATUSES = ["queued", "running", "waiting_user", "stuck", "paused", "error", "done", "archived"]
+INBOX_KINDS = ["approve_spec", "permission", "question", "merge", "error", "unverified", "login", "stuck", "recommend"]
 
 
 _ROOM_ID = re.compile(r"^r[0-9a-f]{8}$")
@@ -105,6 +105,20 @@ class Room:
     # Task 20：代管（原本要你按的事改由 Decision-1 與審查模型決定；合併、危險指令、登入仍歸你）
     delegate: bool = False
     delegate_last: str = ""  # 代管最近一次決定的問題標題（同一題連續第 2 次 → 交給你）
+    # 全權交付（進展量測、升級階梯、預算、停下等你、能力庫、專案知識、自動改寫）
+    rounds: List[Dict] = field(default_factory=list)
+    ladder: Dict = field(default_factory=dict)
+    budget: Dict = field(default_factory=dict)
+    spent: Dict = field(default_factory=dict)
+    baseline: Dict = field(default_factory=dict)
+    env_accepted: List[str] = field(default_factory=list)
+    user_info: str = ""
+    notes_dir: str = ""
+    capabilities: Optional[List[str]] = None
+    caps_loaded: Dict[str, str] = field(default_factory=dict)
+    lessons_used: List[str] = field(default_factory=list)
+    autotune: Dict = field(default_factory=dict)
+    stuck_reason: str = ""
 
 
 def _from_dict(cls, d: Dict[str, Any]):
