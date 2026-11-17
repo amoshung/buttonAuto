@@ -16,10 +16,10 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import verifier
-from team import gitops
+from team import events, gitops, rounds
 from team.gitops import GitError, Worktree
 
 log = logging.getLogger(__name__)
@@ -73,7 +73,8 @@ def _decode(data: bytes) -> str:
 
 
 def run_cmd(cwd: str, cmd: str, timeout: float = 600, env: Optional[Dict[str, str]] = None,
-            cancel: Optional[threading.Event] = None) -> CmdResult:
+            cancel: Optional[threading.Event] = None, log_path: str = "",
+            secrets: Sequence[str] = ()) -> CmdResult:
     """以 shell 執行；stdout 與 stderr 合併，只留最後 4000 字。逾時殺掉整個程序樹，exit_code=-1。
     cancel 被設定時也殺掉整個程序樹，回傳 cancelled=True、exit_code=-1（每 0.1 秒檢查一次）。"""
     start = time.monotonic()
@@ -116,6 +117,13 @@ def run_cmd(cwd: str, cmd: str, timeout: float = 600, env: Optional[Dict[str, st
         text += "\n…（逾時 %s 秒，已停止）" % timeout
     if cancelled:
         text += "\n…（%s）" % CANCELLED
+    if log_path:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+            with open(log_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(events.mask_text(text, secrets))
+        except OSError:
+            pass
     code = -1 if (timed_out or cancelled) else p.returncode
     return CmdResult(cmd, code, time.monotonic() - start, timed_out, text[-TAIL_CHARS:], cancelled)
 
@@ -189,6 +197,12 @@ class TestGate:
     results: List[CmdResult] = field(default_factory=list)
     unverified: str = ""  # 非空＝無法驗證（交給使用者，不送給代理）；此時 ok 一定是 False
     cancelled: bool = False  # 被取消（房間暫停）；結果不完整，呼叫端不要採用
+    failed: Optional[List[str]] = None
+    new_failures: List[str] = field(default_factory=list)
+    env_failures: List[str] = field(default_factory=list)
+    criteria_passed: List[str] = field(default_factory=list)
+    fingerprint: str = ""
+    logs: List[str] = field(default_factory=list)
 
 
 def _fail_text(r: CmdResult) -> str:
@@ -335,54 +349,184 @@ def deny_issue(cmd: str, pattern: str) -> str:
     return "驗收指令命中危險規則：%s（%s）" % (pattern, cmd)
 
 
-def test_gate(wt: Worktree, test_cmd: str, criteria: List[Dict[str, str]],
+def _strip_env_failures(tail: str, env_failures: Sequence[str]) -> str:
+    """從測試輸出摘要中濾除環境既有失敗（env_failures）的區塊與摘要行，避免送給代理盲修。"""
+    if not tail or not env_failures:
+        return tail
+    env_ids = set(env_failures)
+    env_funcs = {x.rsplit("::", 1)[-1] for x in env_ids if "::" in x}
+    out_lines: List[str] = []
+    skip_section = False
+    for line in tail.splitlines():
+        s = line.strip()
+        if s.startswith("___") and s.endswith("___"):
+            title = s.strip("_ ").strip()
+            skip_section = title in env_ids or title in env_funcs or any(title.endswith(fn) for fn in env_funcs)
+            if skip_section:
+                continue
+        elif s.startswith("===") and s.endswith("==="):
+            skip_section = False
+        if skip_section:
+            continue
+        if any(eid in line for eid in env_ids) or any(fn in line for fn in env_funcs):
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+def test_gate(wt: Worktree, test_cmd: str, criteria: List[Dict[str, Any]],
               cancel: Optional[threading.Event] = None,
-              deny_patterns: Optional[List[str]] = None) -> TestGate:
+              deny_patterns: Optional[List[str]] = None,
+              baseline: Optional[Any] = None,
+              env_accepted: Sequence[str] = (),
+              log_dir: str = "",
+              gate_no: int = 0,
+              secrets: Sequence[str] = ()) -> TestGate:
     """deny_patterns：命中危險規則的指令不執行，記為缺口（縱深防禦；spec 階段已要求使用者確認）。"""
     issues: List[str] = []
     results: List[CmdResult] = []
+    logs: List[str] = []
+    cache: Dict[str, CmdResult] = {}
     unverified = ""
     tests_ok = False
-    if not (test_cmd or "").strip():
+    failed: Optional[List[str]] = None
+    new_failures: List[str] = []
+    env_failures: List[str] = []
+    criteria_passed: List[str] = []
+    base_failed = set(
+        getattr(baseline, "failed", None)
+        or (baseline.get("failed", []) if isinstance(baseline, dict) else [])
+    ) | set(env_accepted or ())
+
+    def _exec(c_str: str) -> CmdResult:
+        if c_str in cache:
+            return cache[c_str]
+        lp = os.path.join(log_dir, "gate-%d-%d.txt" % (gate_no, len(results) + 1)) if log_dir else ""
+        res = run_cmd(wt.path, c_str, cancel=cancel, log_path=lp, secrets=secrets)
+        results.append(res)
+        if lp and os.path.isfile(lp):
+            logs.append(lp)
+        cache[c_str] = res
+        return res
+
+    test_res: Optional[CmdResult] = None
+    tcmd = (test_cmd or "").strip()
+    if not tcmd:
         issues.append("沒有測試指令，無法驗證")
-    elif git_problem(test_cmd):
-        issues.append("%s：%s" % (git_problem(test_cmd), test_cmd))
-    elif deny_hit(test_cmd, deny_patterns):
-        issues.append(deny_issue(test_cmd, deny_hit(test_cmd, deny_patterns)) + "，不執行")
+    elif git_problem(tcmd):
+        issues.append("%s：%s" % (git_problem(tcmd), tcmd))
+    elif deny_hit(tcmd, deny_patterns):
+        issues.append(deny_issue(tcmd, deny_hit(tcmd, deny_patterns)) + "，不執行")
     else:
-        r = run_cmd(wt.path, test_cmd, cancel=cancel)
-        results.append(r)
-        if r.cancelled:
-            return TestGate(False, [CANCELLED], results, "", True)
-        tests_ok = r.exit_code == 0
+        test_res = _exec(tcmd)
+        if test_res.cancelled:
+            return TestGate(False, [CANCELLED], results, "", True, logs=logs)
+        failed = rounds.parse_failures(test_res.tail)
+        if failed is not None:
+            new_failures = sorted(set(failed) - base_failed)
+            env_failures = sorted(set(failed) & base_failed)
+        tests_ok = (test_res.exit_code == 0) or (failed is not None and len(new_failures) == 0)
         if not tests_ok:
-            issues.append("測試沒通過（%s）：%s\n%s" % (_fail_text(r), test_cmd, r.tail[-ISSUE_TAIL:]))
+            shown_tail = _strip_env_failures(test_res.tail[-ISSUE_TAIL:], env_failures)
+            if failed is not None and new_failures:
+                issues.append(
+                    "測試沒通過（%s，新增失敗：%s）：%s\n%s"
+                    % (_fail_text(test_res), "、".join(new_failures[:10]), tcmd, shown_tail)
+                )
+            else:
+                issues.append("測試沒通過（%s）：%s\n%s" % (_fail_text(test_res), tcmd, shown_tail))
     for c in criteria or []:
+        cid = str(c.get("id", "?"))
         check = (c.get("check") or "").strip()
-        if not check or check.lower() == "manual":
+        if not check or check.lower() == "manual" or bool(c.get("env_dependent")):
+            continue
+        if git_problem(check):
+            issues.append("條件 %s：%s（%s）" % (cid, git_problem(check), check))
             continue
         hit = deny_hit(check, deny_patterns)
         if hit:
-            issues.append("條件 %s：%s，不執行" % (c.get("id", "?"), deny_issue(check, hit)))
+            issues.append("條件 %s：%s，不執行" % (cid, deny_issue(check, hit)))
             continue
-        r = run_cmd(wt.path, check, cancel=cancel)
-        results.append(r)
+        r = _exec(check)
         if r.cancelled:
-            return TestGate(False, [CANCELLED], results, "", True)
-        if r.exit_code != 0:
+            return TestGate(False, [CANCELLED], results, "", True, logs=logs)
+        if r.exit_code == 0 or (check == tcmd and tests_ok):
+            criteria_passed.append(cid)
+        else:
             issues.append("條件 %s 的檢查沒通過（%s）：%s\n%s"
-                          % (c.get("id", "?"), _fail_text(r), check, r.tail[-ISSUE_TAIL:]))
+                          % (cid, _fail_text(r), check, r.tail[-ISSUE_TAIL:]))
+
+    fp = ""
+    if not tests_ok and test_res is not None:
+        fp = rounds.fingerprint(new_failures if failed is not None else None, test_res.tail, test_res.exit_code)
+    elif issues:
+        bad_r = next((x for x in results if x.exit_code != 0), None)
+        fp = rounds.fingerprint(
+            new_failures or None,
+            bad_r.tail if bad_r else "\n".join(issues),
+            bad_r.exit_code if bad_r else 1,
+        )
+
     if tests_ok:  # 測試本身沒過時，換回原狀檢查沒有意義
         if cancel is not None and cancel.is_set():
-            return TestGate(False, [CANCELLED], results, "", True)
-        ok, msg = mutation_check(wt, test_cmd, cancel=cancel)
+            return TestGate(False, [CANCELLED], results, "", True, logs=logs)
+        mut_cmd = tcmd
+        if test_res is not None and test_res.seconds > 120 and "pytest" in tcmd:
+            tfiles = [
+                f for f in gitops.changed_files(wt)
+                if is_test_path(f) and not f.replace("\\", "/").startswith("docs/")
+                and os.path.isfile(os.path.join(wt.path, f))
+            ]
+            if tfiles:
+                mut_cmd = "%s %s" % (tcmd, " ".join('"%s"' % f for f in tfiles))
+        ok, msg = mutation_check(wt, mut_cmd, cancel=cancel, env_failures=base_failed)
         if cancel is not None and cancel.is_set():
-            return TestGate(False, [CANCELLED], results, "", True)
+            return TestGate(False, [CANCELLED], results, "", True, logs=logs)
         if ok is None:
             unverified = msg
         elif not ok:
             issues.append(msg)
-    return TestGate(not issues and not unverified, issues, results, unverified)
+    return TestGate(
+        not issues and not unverified,
+        issues,
+        results,
+        unverified,
+        False,
+        failed=failed,
+        new_failures=new_failures,
+        env_failures=env_failures,
+        criteria_passed=criteria_passed,
+        fingerprint=fp,
+        logs=logs,
+    )
+
+
+def quick_check(
+    wt: Worktree,
+    criteria: List[Dict[str, Any]],
+    test_cmd: str,
+    cancel: Optional[threading.Event] = None,
+    deny_patterns: Optional[List[str]] = None,
+) -> List[str]:
+    """輕量量測：只跑各條件的 check（跳過 manual、env_dependent、與 test_cmd 相同、git/deny 命中），回傳通過的條件 id。"""
+    tcmd = (test_cmd or "").strip()
+    cache: Dict[str, int] = {}
+    passed: List[str] = []
+    for c in criteria or []:
+        cid = str(c.get("id", "?"))
+        check = (c.get("check") or "").strip()
+        if not check or check.lower() == "manual" or bool(c.get("env_dependent")) or check == tcmd:
+            continue
+        if git_problem(check) or deny_hit(check, deny_patterns):
+            continue
+        if check not in cache:
+            r = run_cmd(wt.path, check, cancel=cancel)
+            if r.cancelled:
+                break
+            cache[check] = r.exit_code
+        if cache.get(check) == 0:
+            passed.append(cid)
+    return passed
 
 
 _TEST_DIRS = {"tests", "test", "__tests__", "spec", "specs"}
@@ -496,7 +640,8 @@ def _clear_pycache(tmp: str, links: List[str]) -> None:
 
 
 def mutation_check(wt: Worktree, test_cmd: str,
-                   cancel: Optional[threading.Event] = None) -> Tuple[Optional[bool], str]:
+                   cancel: Optional[threading.Event] = None,
+                   env_failures: Sequence[str] = ()) -> Tuple[Optional[bool], str]:
     """把這次改動的原始碼換回 base 版本後跑測試，期望測試失敗。
 
     回傳 (True, 說明)＝測試確實檢查了改動；(False, 說明)＝換回後仍通過，測試是假的；
@@ -517,7 +662,7 @@ def mutation_check(wt: Worktree, test_cmd: str,
     state: Dict[str, Any] = {"added": False, "links": []}
     result: Tuple[Optional[bool], str] = (None, "換回原狀檢查沒有完成")
     try:
-        result = _mutate(wt, test_cmd, sources, parent, tmp, state, cancel)
+        result = _mutate(wt, test_cmd, sources, parent, tmp, state, cancel, set(env_failures or ()))
     finally:
         leftover = _cleanup_copy(wt, parent, tmp, state)
     if leftover:
@@ -526,8 +671,10 @@ def mutation_check(wt: Worktree, test_cmd: str,
 
 
 def _mutate(wt: Worktree, test_cmd: str, sources: List[str], parent: str, tmp: str,
-            state: Dict[str, Any], cancel: Optional[threading.Event] = None) -> Tuple[Optional[bool], str]:
+            state: Dict[str, Any], cancel: Optional[threading.Event] = None,
+            env_set: Optional[Set[str]] = None) -> Tuple[Optional[bool], str]:
     links: List[str] = state["links"]
+    env_s = set(env_set or ())
     try:
         os.makedirs(parent, exist_ok=True)
         gitops.git(wt.path, "worktree", "add", "--detach", tmp, "HEAD", timeout=gitops.WORKTREE_ADD_TIMEOUT)
@@ -563,7 +710,8 @@ def _mutate(wt: Worktree, test_cmd: str, sources: List[str], parent: str, tmp: s
         r = run_cmd(tmp, test_cmd, env=MUT_ENV, cancel=cancel)
         if r.cancelled:
             return None, CANCELLED
-        if r.exit_code == 0:
+        mut_failed = rounds.parse_failures(r.tail) if env_s else None
+        if r.exit_code == 0 or (mut_failed is not None and set(mut_failed) <= env_s):
             return False, "把改動換回原狀後測試仍然通過：測試沒有真正檢查這次的改動"
         for rel, data in current.items():  # 恢復成改動後的樣子，確認副本本身能通過測試
             full = _safe_target(root_real, tmp, rel)
@@ -580,7 +728,9 @@ def _mutate(wt: Worktree, test_cmd: str, sources: List[str], parent: str, tmp: s
     base_run = run_cmd(tmp, test_cmd, env=MUT_ENV, cancel=cancel)
     if base_run.cancelled:
         return None, CANCELLED
-    if base_run.exit_code != 0:
+    base_failed = rounds.parse_failures(base_run.tail) if env_s else None
+    base_ok = (base_run.exit_code == 0) or (base_failed is not None and set(base_failed) <= env_s)
+    if not base_ok:
         return None, ("暫存副本裡測試本身就無法通過（%s），無法做換回原狀檢查；"
                       "可能是測試依賴被 .gitignore 排除的檔案：\n%s"
                       % (_fail_text(base_run), base_run.tail[-ISSUE_TAIL:]))

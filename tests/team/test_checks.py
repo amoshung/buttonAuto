@@ -20,7 +20,7 @@ def run(cwd, *args):
 def write(root, rel, text):
     full = os.path.join(root, rel)
     os.makedirs(os.path.dirname(full), exist_ok=True)
-    with open(full, "w", encoding="utf-8") as f:
+    with open(full, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
 
 

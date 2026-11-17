@@ -170,6 +170,10 @@ class AppConfig:
     team_cost_weight: float = 0.3
     # 對話用量達到這個比例 → 存檔、開新對話
     team_context_rollover: float = 0.70
+    # 舊助理工作文件相對路徑（分號分隔；發現就從 worktree 移除）
+    team_legacy_doc_dirs: str = "docs/ai-team"
+    # 額外要連結進 worktree 的 git 外資料目錄（分號分隔）
+    team_env_dirs: str = ""
 
     @classmethod
     def load(cls, path: str = DEFAULT_CONFIG_PATH) -> "AppConfig":
@@ -227,6 +231,13 @@ class AppConfig:
 
     def team_plugin_list(self) -> List[str]:
         return [p.strip() for p in (self.team_plugin_dirs or "").split(";") if p.strip()]
+
+    def team_legacy_doc_list(self) -> List[str]:
+        vals = [p.strip() for p in (self.team_legacy_doc_dirs or "").split(";") if p.strip()]
+        return vals or ["docs/ai-team"]
+
+    def team_env_dir_list(self) -> List[str]:
+        return [p.strip() for p in (self.team_env_dirs or "").split(";") if p.strip()]
 
     def apply_autonomy(self, level: str) -> bool:
         """套用自主程度預設值；不認得的程度回傳 False、不改任何設定。"""
