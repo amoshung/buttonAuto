@@ -33,10 +33,22 @@ from urllib.parse import parse_qs, urlparse
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(BASE_DIR, "web")
 CONSOLE_DIR = os.path.join(WEB_DIR, "console")
+PIXEL_DIR = os.path.join(WEB_DIR, "pixel")
 RUNTIME_PATH = os.path.join(BASE_DIR, "runtime.local.json")
 TOKEN_PATH = os.path.join(BASE_DIR, "web_token.local")
 ERROR_LOG = os.path.join(BASE_DIR, "error.log")
+SERVER_LOG = os.path.join(BASE_DIR, "server.log")
 APP_NAME = "AI 工程助理"
+
+if sys.stdout is None or sys.stderr is None:
+    try:
+        _log_fh = open(SERVER_LOG, "a", encoding="utf-8", errors="replace", buffering=1)
+        if sys.stdout is None:
+            sys.stdout = _log_fh
+        if sys.stderr is None:
+            sys.stderr = _log_fh
+    except OSError:
+        pass
 
 from ai_settings import AISettings, DEFAULT_SECRETS_PATH  # noqa: E402
 from automation import AutomationWorker, check_deny  # noqa: E402
@@ -68,7 +80,7 @@ def code_version() -> str:
 def code_mtime() -> float:
     """程式與網頁檔案最新的修改時間（偵測「磁碟上的程式比執行中的新」）。"""
     newest = 0.0
-    for d in (BASE_DIR, CONSOLE_DIR):
+    for d in (BASE_DIR, PIXEL_DIR):
         try:
             for f in os.listdir(d):
                 if f.endswith((".py", ".js", ".css", ".html")):
@@ -383,23 +395,115 @@ class AssistantServer:
         if path == "/api/team/projects":
             from team.scan import known_projects
             return {"projects": known_projects(self.team_known_repos())}
+        if path == "/api/team/ssh/hosts":
+            return t.ssh_hosts_view()
         if path == "/api/team/scan":
             from team.scan import scan_project
             raw = arg("path").strip()
+            ssh_host = arg("ssh_host").strip()
             if not raw:
                 raise TeamError(400, "請提供專案資料夾路徑")
+            if ssh_host:
+                try:
+                    return t.remote_scan_project(ssh_host, raw)
+                except Exception as e:
+                    raise TeamError(400, str(e))
             bad = local_path_problem(raw)
             if bad:
                 raise TeamError(400, bad)
             if not os.path.isdir(raw):
                 raise TeamError(400, "找不到資料夾：%s" % raw)
             return scan_project(raw)
+        if path == "/api/team/dirs":
+            raw = arg("path").strip()
+            ssh_host = arg("ssh_host").strip()
+            if ssh_host:
+                try:
+                    return t.remote_browse_dirs(ssh_host, raw)
+                except Exception as e:
+                    raise TeamError(400, str(e))
+            drives = []
+            if os.name == "nt":
+                for d in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+                    dp = f"{d}:\\"
+                    if os.path.isdir(dp):
+                        drives.append(dp)
+            cur = os.path.abspath(raw) if raw and os.path.isdir(raw) else os.getcwd()
+            parent = os.path.dirname(cur.rstrip("/\\"))
+            if parent == cur:
+                parent = ""
+            skip = {".git", ".ai-team-worktrees", ".ai-team-mutation", "node_modules", "__pycache__", ".venv", "venv"}
+            dirs = []
+            try:
+                for entry in sorted(os.scandir(cur), key=lambda e: e.name.lower()):
+                    if entry.is_dir(follow_symlinks=False) and not entry.name.startswith(".") and entry.name not in skip:
+                        dirs.append({"name": entry.name, "path": entry.path})
+            except OSError:
+                pass
+            return {"path": cur, "parent": parent, "dirs": dirs[:120], "drives": drives}
         if path == "/api/team/room":
             room = self._team_room(arg("id"))
             # 最近 100 筆、不含 detail（大）；細節用 /api/team/room/events?id=&ids= 依事件 id 讀
             from team.rooms import slim_event
+            from team import ce_sync
+            sh = (getattr(room, "ssh_host", "") or "").strip()
+            ce_info = (
+                ce_sync.sync_remote_ce_plan(
+                    sh,
+                    room.repo,
+                    reference_root=room.reference_root,
+                    target_subdir=room.target_subdir,
+                    target_subdirs=list(getattr(room, "target_subdirs", None) or ()),
+                    plan_rel=getattr(room, "selected_plan_rel", "") or "",
+                )
+                if sh and room.repo
+                else (
+                    ce_sync.sync_room_ce_plan(
+                        room.repo,
+                        reference_root=room.reference_root,
+                        plan_rel=getattr(room, "selected_plan_rel", "") or "",
+                    )
+                    if room.repo
+                    else {}
+                )
+            )
+            wiki_info = t.kb.wiki_view(room.repo, reference_root=room.reference_root, sync=False) if room.repo and not room.demo else {}
+            progress_info = t.get_room_progress(room.id)
             return {"room": asdict(room), "events": [slim_event(e) for e in reversed(t.store.events(room.id, limit=100))],
-                    "inbox": [asdict(i) for i in t.store.inbox() if i.room_id == room.id]}
+                    "inbox": [asdict(i) for i in t.store.inbox() if i.room_id == room.id],
+                    "ce": ce_info, "wiki": wiki_info, "progress": progress_info}
+        if path == "/api/team/room/progress":
+            room = self._team_room(arg("id"))
+            return {"ok": True, "progress": t.get_room_progress(room.id)}
+        if path == "/api/team/room/trace":
+            room = self._team_room(arg("id"))
+            try:
+                limit = int(arg("limit") or "200")
+            except ValueError:
+                limit = 200
+            from engine.trace import RoomTracer
+
+            tracer = RoomTracer(t.store._dir(room.id), room.id)
+            return {"ok": True, "room_id": room.id, "path": tracer.path, "entries": tracer.read(limit=limit)}
+        if path == "/api/team/wiki":
+            from team import ce_sync
+            rid = arg("room").strip()
+            repo = arg("repo").strip()
+            ref_root = ""
+            t_sub = ""
+            t_subs: List[str] = []
+            if rid:
+                room = self._team_room(rid)
+                repo = room.repo
+                ref_root = room.reference_root
+                t_sub = room.target_subdir
+                t_subs = list(getattr(room, "target_subdirs", None) or [])
+            if not repo:
+                raise TeamError(400, "請提供 room 或 repo")
+            return {
+                "wiki": t.kb.wiki_view(repo, reference_root=ref_root, target_subdir=t_sub, target_subdirs=t_subs),
+                "ce": ce_sync.sync_room_ce_plan(repo, reference_root=ref_root),
+            }
         if path == "/api/team/room/events":
             room = self._team_room(arg("id"))
             ids = [x.strip() for x in arg("ids").split(",") if x.strip()][:20]
@@ -409,9 +513,32 @@ class AssistantServer:
         if path == "/api/team/fleet":
             return {"fleet": self.team_snapshot()["fleet"], "catalog": t.catalog}
         if path == "/api/team/usage":
-            return t.usage_summary()
+            summary = t.usage_summary()
+            self._enforce_daily_token_budget(summary)
+            return summary
+        if path == "/api/team/preflight":
+            from team import bootstrap
+            return bootstrap.run_preflight_check(self._team_base_dir)
+        if path == "/api/team/budget":
+            summary = t.usage_summary()
+            today_tokens = self._today_total_tokens(summary)
+            limit = int(getattr(self.cfg, "team_daily_token_limit", 0) or 0)
+            exceeded = self._enforce_daily_token_budget(summary)
+            rooms = t.store.list() if hasattr(t, "store") else []
+            running_rooms = sum(1 for r in rooms if getattr(r, "status", "") in ("running", "working", "building"))
+            return {
+                "ok": True,
+                "daily_token_limit": limit,
+                "today_tokens": today_tokens,
+                "exceeded": exceeded,
+                "running_rooms": running_rooms,
+                "total_rooms": len(rooms),
+            }
+        if path == "/api/team/profile/export":
+            from team import bootstrap
+            return bootstrap.export_safe_profile(self.cfg, self._team_base_dir)
         if path == "/api/team/models":
-            return t.models_view()
+            return t.models_view(ssh_host=arg("ssh_host").strip())
         if path == "/api/team/legacy_docs":
             from team import notes
             dirs = self.cfg.team_legacy_doc_list()
@@ -421,6 +548,20 @@ class AssistantServer:
                 if found:
                     repos.append({"repo": r, "dirs": found})
             return {"repos": repos}
+        if path == "/api/team/weather":
+            svc = self._get_weather_service()
+            try:
+                return svc.get_weather(
+                    lat=arg("lat").strip() or None,
+                    lon=arg("lon").strip() or None,
+                    city=arg("city").strip(),
+                    force_refresh=arg("refresh").strip() in ("1", "true", "yes"),
+                )
+            except ValueError as e:
+                raise TeamError(400, str(e))
+        if path == "/api/team/catalog":
+            cat = self._get_model_catalog()
+            return {"ok": True, **cat.snapshot()}
         if path == "/api/team/prompts":
             rid = arg("room").strip()
             if rid:
@@ -442,6 +583,23 @@ class AssistantServer:
             return {"ok": True, "role": role, "version": p.version, "text": p.text}
         return None
 
+    def _get_weather_service(self):
+        svc = getattr(self, "_weather_service", None)
+        if svc is None:
+            from team.weather import WeatherService
+            svc = WeatherService()
+            self._weather_service = svc
+        return svc
+
+    def _get_model_catalog(self):
+        cat = getattr(self, "_model_catalog", None)
+        if cat is None:
+            from team.model_catalog import ModelCatalogService
+            cat = ModelCatalogService(self._team_base_dir)
+            cat.start_daily_scheduler()
+            self._model_catalog = cat
+        return cat
+
     def _team_room(self, room_id: str):
         try:
             room = self.team.store.get(room_id)
@@ -461,18 +619,65 @@ class AssistantServer:
     def team_post(self, path: str, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """POST /api/team/*。業務上的拒絕回 {ok: false, text}（200）；格式錯 400、找不到 404。"""
         t = self.team
+        if path == "/api/team/ssh/hosts":
+            action = str(body.get("action") or "add").strip().lower()
+            target = self._need(body, "target").strip()
+            try:
+                if action in ("remove", "delete"):
+                    return t.remove_ssh_host(target)
+                return t.add_ssh_host(target, label=str(body.get("label") or "").strip())
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+        if path == "/api/team/ssh/probe":
+            ssh_host = str(body.get("ssh_host") or "").strip()
+            force = bool(body.get("force", True))
+            password = str(body.get("password") or "")
+            install_key = bool(body.get("install_key", False))
+            quick_auth = bool(body.get("quick_auth", False))
+            try:
+                return t.probe_ssh_host(
+                    ssh_host,
+                    force=force,
+                    password=password,
+                    install_key=install_key,
+                    quick_auth=quick_auth,
+                )
+            except Exception as e:
+                from team.ssh import is_ssh_auth_error
+                return {"ok": False, "ssh_host": ssh_host, "text": str(e), "error": str(e),
+                        "auth_required": is_ssh_auth_error(str(e)),
+                        "clis": {}, "available_seats": [], "seats_models": {}}
         if path == "/api/team/rooms":
             paths = body.get("allowed_paths", [])
             if not isinstance(paths, list) or not all(isinstance(x, str) for x in paths):
                 raise TeamError(400, "allowed_paths 必須是字串清單")
+            target_subdirs = body.get("target_subdirs", None)
+            if target_subdirs is not None and (not isinstance(target_subdirs, list) or not all(isinstance(x, str) for x in target_subdirs)):
+                raise TeamError(400, "target_subdirs 必須是字串清單")
             for k in ("repo", "goal", "source", "impl_cli", "review_cli", "autonomy", "name", "impl_model",
-                      "review_model"):
-                if k in body and not isinstance(body[k], str):
+                      "review_model", "target_subdir", "ssh_host", "reference_root", "supervisor_cli", "supervisor_model",
+                      "task_mode", "engine_version"):
+                if k in body and body[k] is not None and not isinstance(body[k], str):
                     raise TeamError(400, "欄位 %s 必須是字串" % k)
-            if body.get("repo", "").strip():
-                bad = local_path_problem(body["repo"])
-                if bad:
-                    raise TeamError(400, bad)
+            role_prefs = body.get("role_prefs", None)
+            if role_prefs is not None and not isinstance(role_prefs, dict):
+                raise TeamError(400, "role_prefs 必須是物件")
+            ssh_host = str(body.get("ssh_host") or "").strip()
+            if not ssh_host:
+                if body.get("repo", "").strip():
+                    bad = local_path_problem(body["repo"])
+                    if bad:
+                        raise TeamError(400, bad)
+                if body.get("reference_root", "") and str(body.get("reference_root")).strip():
+                    bad_ref = local_path_problem(str(body["reference_root"]).strip())
+                    if bad_ref:
+                        raise TeamError(400, bad_ref)
+                if target_subdirs:
+                    for sub_p in target_subdirs:
+                        if os.path.isabs(sub_p.strip()):
+                            bad_sub = local_path_problem(sub_p.strip())
+                            if bad_sub:
+                                raise TeamError(400, bad_sub)
             try:
                 room = t.create_room(repo=body.get("repo", ""), goal=body.get("goal", ""),
                                      source=body.get("source", "goal") or "goal",
@@ -480,7 +685,18 @@ class AssistantServer:
                                      review_cli=body.get("review_cli", "auto") or "auto",
                                      autonomy=body.get("autonomy", "balanced") or "balanced",
                                      allowed_paths=paths, name=body.get("name", ""),
-                                     impl_model=body.get("impl_model", ""), review_model=body.get("review_model", ""))
+                                     impl_model=body.get("impl_model", ""), review_model=body.get("review_model", ""),
+                                     target_subdir=body.get("target_subdir", "") or "",
+                                     target_subdirs=target_subdirs,
+                                     reference_root=str(body.get("reference_root") or "").strip(),
+                                     supervisor_cli=str(body.get("supervisor_cli") or "auto").strip() or "auto",
+                                     supervisor_model=str(body.get("supervisor_model") or "").strip(),
+                                     role_prefs=role_prefs,
+                                     ssh_host=ssh_host,
+                                     task_mode=str(body.get("task_mode") or "standard").strip() or "standard",
+                                     d1_fast_review=bool(body.get("d1_fast_review", True)),
+                                     use_worktree=bool(body.get("use_worktree", False)),
+                                     engine_version=str(body.get("engine_version") or "v2").strip() or "v2")
             except ValueError as e:
                 return {"ok": False, "text": str(e)}
             return {"ok": True, "room": asdict(room)}
@@ -504,18 +720,204 @@ class AssistantServer:
             except ValueError as e:
                 return {"ok": False, "text": str(e)}
             return {"ok": True, "text": "已開啟代管" if room.delegate else "已關閉代管", "room": asdict(room)}
+        if path == "/api/team/rooms/goal":
+            room = self._team_room(self._need(body, "id"))
+            goal = body.get("goal", "")
+            if not isinstance(goal, str):
+                raise TeamError(400, "欄位 goal 必須是字串")
+            try:
+                room = t.set_room_goal(room.id, goal)
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+            return {"ok": True, "text": "已更新房間目標" if room.goal else "已清空房間目標", "room": asdict(room)}
+        if path == "/api/team/rooms/folders":
+            room = self._team_room(self._need(body, "id"))
+            repo = str(body.get("repo") or "")
+            reference_root = str(body.get("reference_root") or "")
+            target_subdir = str(body.get("target_subdir") or "")
+            target_subdirs = body.get("target_subdirs", None)
+            if target_subdirs is not None and (not isinstance(target_subdirs, list) or not all(isinstance(x, str) for x in target_subdirs)):
+                raise TeamError(400, "target_subdirs 必須是字串清單")
+            try:
+                room = t.set_room_folders(
+                    room.id,
+                    repo=repo,
+                    reference_root=reference_root,
+                    target_subdir=target_subdir,
+                    target_subdirs=target_subdirs,
+                )
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+            return {
+                "ok": True,
+                "text": "已儲存目標工作資料夾與唯讀參考範圍設定",
+                "room": asdict(room),
+            }
+        if path == "/api/team/rooms/progress":
+            room = self._team_room(self._need(body, "id"))
+            note = str(body.get("note") or "")
+            prog = t.sync_room_progress(room.id, extra_note=note)
+            return {"ok": True, "text": "已更新房間 progress.md 斷點紀錄", "progress": prog}
+        if path == "/api/team/rooms/sync_plan":
+            room = self._team_room(self._need(body, "id"))
+            plan_rel = str(body.get("plan_rel") or "")
+            apply_goal = bool(body.get("apply_goal", False))
+            try:
+                res = t.sync_room_plan(room.id, plan_rel=plan_rel, apply_goal=apply_goal)
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+            return res
+        if path == "/api/team/rooms/plan_content":
+            room = self._team_room(self._need(body, "id"))
+            plan_rel = str(body.get("plan_rel") or getattr(room, "selected_plan_rel", "") or "").strip().replace("\\", "/")
+            if not plan_rel or ".." in plan_rel.split("/") or plan_rel.startswith("/"):
+                return {"ok": False, "text": "無效的計畫檔案路徑"}
+            sh = (getattr(room, "ssh_host", "") or "").strip()
+            base_dir = (getattr(room, "worktree", "") or getattr(room, "repo", "") or "").strip()
+            if sh and base_dir:
+                from team.ssh import remote_fs
+                try:
+                    res = remote_fs(sh, "read_file", base_dir, rel=plan_rel, timeout=10.0)
+                    if isinstance(res, dict) and res.get("ok"):
+                        return {"ok": True, "plan_rel": plan_rel, "content": str(res.get("content") or "")}
+                    # fallback via remote_exec cat
+                    from team.ssh import remote_exec
+                    import shlex
+                    r2 = remote_exec(sh, base_dir, f"cat {shlex.quote(plan_rel)}", shell=True, timeout=10.0)
+                    if int(r2.get("exit_code", 1)) == 0:
+                        return {"ok": True, "plan_rel": plan_rel, "content": str(r2.get("stdout") or "")}
+                except Exception as e:
+                    return {"ok": False, "text": f"讀取遠端計畫失敗：{e}"}
+                return {"ok": False, "text": f"找不到遠端計畫：{plan_rel}"}
+            if base_dir and os.path.isdir(base_dir):
+                full = os.path.abspath(os.path.join(base_dir, plan_rel))
+                if not full.startswith(os.path.abspath(base_dir)):
+                    return {"ok": False, "text": "無效的計畫檔案路徑"}
+                if os.path.isfile(full):
+                    with open(full, "r", encoding="utf-8", errors="replace") as f:
+                        return {"ok": True, "plan_rel": plan_rel, "content": f.read()}
+            return {"ok": False, "text": f"找不到計畫檔案：{plan_rel}"}
+        if path == "/api/team/rooms/clear_plan":
+            room = self._team_room(self._need(body, "id"))
+            try:
+                return t.clear_room_plan_and_progress(room.id)
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+        if path == "/api/team/rooms/clear_wiki":
+            room = self._team_room(self._need(body, "id"))
+            try:
+                return t.clear_room_wiki(room.id)
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+        if path == "/api/team/rooms/generate_plan":
+            room = self._team_room(self._need(body, "id"))
+            goal = str(body.get("goal") or "")
+            seat = str(body.get("seat") or "")
+            model = str(body.get("model") or "")
+            interactive = bool(body.get("interactive", False))
+            try:
+                return t.generate_room_plan_from_goal(
+                    room.id, goal=goal, seat=seat, model=model, interactive=interactive
+                )
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+            except Exception as e:
+                return {"ok": False, "text": f"根據目標生成計畫失敗：{e}"}
+        if path == "/api/team/rooms/d1_fast_review":
+            room = self._team_room(self._need(body, "id"))
+            enabled = bool(body.get("enabled", True))
+            return t.set_room_d1_fast_review(room.id, enabled)
+        if path == "/api/team/rooms/unit/rerun":
+            room = self._team_room(self._need(body, "id"))
+            uid = str(body.get("unit_id") or "")
+            try:
+                return t.rerun_room_unit(room.id, uid)
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+        if path == "/api/team/rooms/unit/waive":
+            room = self._team_room(self._need(body, "id"))
+            uid = str(body.get("unit_id") or "")
+            reason = str(body.get("reason") or "")
+            try:
+                return t.waive_room_unit(room.id, uid, reason=reason)
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+        if path == "/api/team/rooms/unit/edit":
+            room = self._team_room(self._need(body, "id"))
+            uid = str(body.get("unit_id") or "")
+            check_cmd = body.get("check_cmd") if "check_cmd" in body else None
+            text_val = body.get("text") if "text" in body else None
+            try:
+                return t.edit_room_unit(room.id, uid, check_cmd=check_cmd, text=text_val)
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+        if path == "/api/team/rooms/brainstorm":
+            room = self._team_room(self._need(body, "id"))
+            messages = body.get("messages") or []
+            if not isinstance(messages, list):
+                raise TeamError(400, "欄位 messages 必須是陣列")
+            mode = str(body.get("mode") or "chat")
+            seat = str(body.get("seat") or "")
+            model = str(body.get("model") or "")
+            goal_draft = str(body.get("goal_draft") or "")
+            try:
+                return t.brainstorm_room(
+                    room.id,
+                    messages=messages,
+                    mode=mode,
+                    seat=seat,
+                    model=model,
+                    goal_draft=goal_draft,
+                )
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+            except Exception as e:
+                return {"ok": False, "text": f"Brainstorm 執行失敗：{e}"}
+        if path == "/api/team/rooms/brainstorm/save_plan":
+            room = self._team_room(self._need(body, "id"))
+            filename = str(body.get("filename") or "")
+            content = str(body.get("content") or "")
+            apply_goal = bool(body.get("apply_goal", True))
+            try:
+                return t.save_brainstorm_plan(
+                    room.id,
+                    filename=filename,
+                    content=content,
+                    apply_goal=apply_goal,
+                )
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+        if path == "/api/team/rooms/reset":
+            room = self._team_room(self._need(body, "id"))
+            try:
+                room = t.reset_room(room.id)
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+            return {"ok": True, "text": "已恢復專案至介入前狀態（分支與舊驗收條件已清除）", "room": asdict(room)}
+        if path == "/api/team/rooms/handoff":
+            room = self._team_room(self._need(body, "id"))
+            new_goal = str(body.get("goal") or "")
+            new_name = str(body.get("name") or "")
+            try:
+                new_room = t.handoff_to_new_room(room.id, new_goal=new_goal, name=new_name)
+            except ValueError as e:
+                return {"ok": False, "text": str(e)}
+            return {"ok": True, "text": "已封存舊房間並開啟新房間接續開發（過去紀錄已載入 LLM Wiki）", "room": asdict(new_room)}
         if path == "/api/team/models":
             return t.save_models(body)
         if path == "/api/team/models/detect":
+            from team.modelprefs import DETECTABLE_SEATS
             seat = body.get("seat", "")
             if not isinstance(seat, str):
                 raise TeamError(400, "欄位 seat 必須是字串")
-            started = t.detect_models([seat] if seat else None)
+            seats_arg = list(DETECTABLE_SEATS) if seat == "all" else ([seat] if seat else None)
+            started = t.detect_models(seats_arg)
             if not started:
                 view = t.models_view()["seats"]
-                busy = [s for s in ([seat] if seat else ("kiro", "agy")) if view.get(s, {}).get("detecting")]
+                check_seats = seats_arg or DETECTABLE_SEATS
+                busy = [s for s in check_seats if view.get(s, {}).get("detecting")]
                 return {"ok": bool(busy), "started": [],
-                        "text": "正在偵測中" if busy else "沒有可偵測的座位（只有 Kiro／Antigravity 可偵測，且要已安裝）"}
+                        "text": "正在偵測中" if busy else "沒有可偵測的座位（需已安裝 Kiro／Antigravity／Claude CLI）"}
             return {"ok": True, "started": started, "text": "已開始偵測：%s（不花 token）" % "、".join(started)}
         if path.startswith("/api/team/rooms/"):
             action = path.rsplit("/", 1)[1]
@@ -523,10 +925,13 @@ class AssistantServer:
                 return None
             room = self._team_room(self._need(body, "id"))
             try:
-                getattr(t, action)(room.id)
+                if action == "archive":
+                    t.archive(room.id, force=bool(body.get("force", False)))
+                else:
+                    getattr(t, action)(room.id)
             except ValueError as e:
                 return {"ok": False, "text": str(e)}
-            return {"ok": True, "text": {"pause": "已暫停", "resume": "已排入繼續", "archive": "已封存"}[action]}
+            return {"ok": True, "text": {"pause": "已暫停", "resume": "已排入繼續", "archive": "已封存（紀錄已存入 LLM Wiki）"}[action]}
         if path == "/api/team/pause_all":
             n, failed = 0, []
             for r in t.store.list():
@@ -632,7 +1037,80 @@ class AssistantServer:
                 return {"ok": False, "text": str(e)}
             self.hub.bump()
             return {"ok": True, "version": ver, "text": "已升為全域（%s）" % ver, "prompts": t.prompts.view(room_id)}
+        if path == "/api/team/preflight/test":
+            from team import bootstrap
+            return bootstrap.test_model_endpoint(
+                base_url=str(body.get("base_url") or ""),
+                api_key=str(body.get("key") or body.get("api_key") or ""),
+                model=str(body.get("glm_model") or body.get("model") or ""),
+            )
+        if path == "/api/team/preflight/save":
+            from team import bootstrap
+            from team.models import ModelRouter, load_model_config
+            try:
+                saved = bootstrap.save_model_config(self._team_base_dir, body)
+            except ValueError as e:
+                raise TeamError(400, str(e))
+            new_cfg = load_model_config(os.path.join(self._team_base_dir, "litellm.local.json"))
+            if new_cfg is not None:
+                t.model_cfg = new_cfg
+                if hasattr(t, "models") and hasattr(t.models, "cfg"):
+                    t.models.cfg = new_cfg
+                else:
+                    t.models = ModelRouter(new_cfg)
+            cat = self._get_model_catalog()
+            threading.Thread(target=cat.scan_now, name="litellm-catalog-save-scan", daemon=True).start()
+            self.hub.bump()
+            return {**saved, "preflight": bootstrap.run_preflight_check(self._team_base_dir)}
+        if path == "/api/team/catalog/scan":
+            cat = self._get_model_catalog()
+            snap = cat.scan_now()
+            self.hub.bump()
+            return {"ok": True, **snap}
+        if path == "/api/team/budget":
+            try:
+                limit = int(body.get("daily_token_limit", 0))
+            except (TypeError, ValueError):
+                raise TeamError(400, "daily_token_limit 必須是整數")
+            limit = max(0, min(100_000_000, limit))
+            with self.cfg_lock:
+                self.cfg.team_daily_token_limit = limit
+                self.cfg.save(self.config_path)
+            self.hub.bump()
+            return {"ok": True, "daily_token_limit": limit}
+        if path == "/api/team/profile/import":
+            from team import bootstrap
+            try:
+                res = bootstrap.import_safe_profile(self.cfg, self.config_path, self._team_base_dir, body)
+            except ValueError as e:
+                raise TeamError(400, str(e))
+            self.hub.bump()
+            return res
         return None
+
+    @staticmethod
+    def _today_total_tokens(summary: Dict[str, Any]) -> int:
+        today = summary.get("today") if isinstance(summary, dict) else None
+        if isinstance(today, dict):
+            if isinstance(today.get("total_tokens"), (int, float)):
+                return int(today["total_tokens"])
+            by_model = today.get("by_model")
+            if isinstance(by_model, dict):
+                return sum(int(v.get("total_tokens", 0) or 0) for v in by_model.values() if isinstance(v, dict))
+        return 0
+
+    def _enforce_daily_token_budget(self, summary: Dict[str, Any]) -> bool:
+        limit = int(getattr(self.cfg, "team_daily_token_limit", 0) or 0)
+        if limit <= 0:
+            return False
+        used = self._today_total_tokens(summary)
+        if used >= limit:
+            t = self._team
+            if t is not None and not getattr(t, "paused_all", False):
+                t.set_paused_all(True)
+                self.hub.log(f"⚠️ 今日 Token 用量 ({used:,}) 已達成本護欄上限 ({limit:,})，已自動暫停全部房間。")
+            return True
+        return False
 
     def _watch_code(self) -> None:
         while not self._stop.wait(20.0):
@@ -835,6 +1313,32 @@ def make_handler(app: AssistantServer):
                 body = body.replace(b"__TOKEN__", app.token.encode("ascii"))
             self._send(200, body, _MIME.get(ext, "application/octet-stream"), csp=csp, cache=cache)
 
+        def _pixel_html(self, full: str) -> None:
+            with open(full, "rb") as f:
+                body = f.read()
+            nonce = secrets.token_urlsafe(16)
+            tok_bytes = app.token.encode("ascii")
+            if b"__TOKEN__" in body:
+                body = body.replace(b"__TOKEN__", tok_bytes)
+            elif b'name="aea-token"' not in body:
+                meta = b'<meta name="aea-token" content="' + tok_bytes + b'">'
+                if b"</head>" in body:
+                    body = body.replace(b"</head>", meta + b"</head>", 1)
+                else:
+                    body = meta + body
+            nonce_attr = b' nonce="' + nonce.encode("ascii") + b'"'
+            body = re.sub(rb"<script(?![^>]*\bnonce=)", b"<script" + nonce_attr, body, flags=re.I)
+            csp = (
+                "default-src 'self'; "
+                f"script-src 'self' 'nonce-{nonce}'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: blob:; "
+                "connect-src 'self'; "
+                "font-src 'self' data:; "
+                "object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+            )
+            self._send(200, body, "text/html; charset=utf-8", csp=csp, cache="no-store")
+
         # ---- GET
         def do_HEAD(self) -> None:
             self.do_GET()
@@ -848,8 +1352,8 @@ def make_handler(app: AssistantServer):
             if path == "/healthz":
                 return self._json(200, {"ok": True, "pid": os.getpid(), "version": app.version})
             if path == "/favicon.ico":
-                full = safe_child(CONSOLE_DIR, "favicon.svg")
-                return self._file(full, cache="max-age=86400") if full else self._send(204, b"", "image/x-icon")
+                full = safe_child(PIXEL_DIR, "favicon.ico") or safe_child(PIXEL_DIR, "favicon.svg")
+                return self._file(full, cache="max-age=86400") if full and os.path.isfile(full) else self._send(204, b"", "image/x-icon")
             qt = (q.get("t") or [""])[0]
             if qt and hmac.compare_digest(qt, app.token):
                 # 帶存取碼的網址：換成 HttpOnly cookie（30 天），再導向乾淨的網址
@@ -873,8 +1377,26 @@ def make_handler(app: AssistantServer):
 
         def _get_authed(self, path: str, q: Dict[str, List[str]]) -> None:
             arg = lambda k: (q.get(k) or [""])[0]  # noqa: E731
-            if path in ("/", "/index.html"):
-                return self._file(os.path.join(CONSOLE_DIR, "index.html"), inject=True)
+            if path in ("/", "/index.html", "/pixel", "/pixel/", "/pixel/index.html"):
+                idx = safe_child(PIXEL_DIR, "index.html")
+                if idx and os.path.isfile(idx):
+                    return self._pixel_html(idx)
+                return self._send(404, b"pixel office not built", "text/plain")
+            if path.startswith("/_next/"):
+                full = safe_child(PIXEL_DIR, path.lstrip("/"))
+                if full and os.path.isfile(full):
+                    return self._file(full, cache="public, max-age=31536000, immutable")
+                return self._send(404, b"not found", "text/plain")
+            if path.startswith("/pixel-assets/"):
+                full = safe_child(PIXEL_DIR, path.lstrip("/"))
+                if full and os.path.isfile(full):
+                    return self._file(full, cache="public, max-age=3600")
+                return self._send(404, b"not found", "text/plain")
+            if path.startswith("/pixel/"):
+                full = safe_child(PIXEL_DIR, path[len("/pixel/"):])
+                if full and os.path.isfile(full):
+                    return self._pixel_html(full) if full.endswith(".html") else self._file(full)
+                return self._send(404, b"not found", "text/plain")
             if path == "/api/state":
                 return self._json(200, app.snapshot())
             if path.startswith("/api/team/"):
@@ -892,8 +1414,8 @@ def make_handler(app: AssistantServer):
             if path == "/api/logs":
                 return self._json(200, {"logs": app.hub.logs_after(int(arg("after") or 0))})
             if path.startswith("/static/"):
-                full = safe_child(CONSOLE_DIR, path[len("/static/"):])
-                if full:
+                full = safe_child(PIXEL_DIR, path[len("/static/"):])
+                if full and os.path.isfile(full):
                     return self._file(full)
             return self._send(404, b"not found", "text/plain")
 
@@ -952,14 +1474,18 @@ def make_handler(app: AssistantServer):
 
         # ---- POST
         def do_POST(self) -> None:
-            if not self._host_ok():
-                return self._send(403, b"forbidden", "text/plain")
-            if not hmac.compare_digest(self.headers.get("X-Token", ""), app.token):
-                return self._json(401, {"ok": False, "text": "存取碼不對（請重新整理頁面）"})
             try:
                 n = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 n = -1
+            if not self._host_ok():
+                if 0 < n <= _POST_MAX:
+                    self.rfile.read(n)
+                return self._send(403, b"forbidden", "text/plain")
+            if not hmac.compare_digest(self.headers.get("X-Token", ""), app.token):
+                if 0 < n <= _POST_MAX:
+                    self.rfile.read(n)
+                return self._json(401, {"ok": False, "text": "存取碼不對（請重新整理頁面）"})
             if not 0 <= n <= _POST_MAX:
                 return self._json(400, {"ok": False, "text": "請求太大"})
             try:
@@ -1056,6 +1582,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         httpd = app.serve(args.port or cfg_port)
         app.write_runtime()
         print(f"[{APP_NAME}] 主控台：http://127.0.0.1:{app.port}/  （PID {os.getpid()}，版本 {app.version}）", flush=True)
+        try:
+            from team import bootstrap
+            pf = bootstrap.run_preflight_check(app._team_base_dir)
+            found_clis = [c["name"] for c in pf["clis"] if c["installed"]]
+            cli_str = ", ".join(found_clis) if found_clis else "無（請於網頁精靈查看安裝指引）"
+            model_str = f"已就緒 ({pf['model']['base_url']})" if pf["model"]["ready"] else "尚未設定（開啟主控台後將引導輸入 IP/Port 與金鑰）"
+            print(f"[{APP_NAME}] 開機健檢 — 本機 CLI：{cli_str} ｜ 模型 API：{model_str}", flush=True)
+        except Exception:
+            pass
         app.hub.log(f"🚀 {APP_NAME} 已啟動：http://127.0.0.1:{app.port}/（版本 {app.version}）")
         if (args.open or app.cfg.open_browser) and not args.no_open:
             threading.Timer(0.6, lambda: webbrowser.open(app.url)).start()

@@ -74,6 +74,18 @@ def run_script(path, prompt, mode, emit_text, allowed=()):
             return str(step["error"])
         if "say" in step:
             emit_text(step["say"])
+        elif "say_report" in step:
+            rep = dict(step["say_report"])
+            sha = _git(cwd, "rev-parse", "--short", "HEAD").stdout.strip() or "HEAD"
+            crit = []
+            for c in rep.get("criteria") or []:
+                c = dict(c)
+                if c.get("commit") in (None, "", "HEAD"):
+                    c["commit"] = sha
+                crit.append(c)
+            if crit:
+                rep["criteria"] = crit
+            emit_text("DONE\n```json\n%s\n```" % json.dumps(rep, ensure_ascii=False))
         elif "echo_prompt" in step:
             emit_text(prompt[:200])
         elif mode == "plan":

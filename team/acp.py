@@ -13,6 +13,7 @@ import os
 import queue
 import subprocess
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from team.events import AgentEvent, PermissionRequest
@@ -102,6 +103,7 @@ class AcpClient:
         self.context_pct = None  # type: Optional[float]
         self.prompt_usage = None  # type: Optional[Dict[str, Any]]
         self._proc = None  # type: Optional[subprocess.Popen]
+        self._last_activity = time.monotonic()
         self._write_lock = threading.Lock()
         self._lock = threading.Lock()
         self._next_id = 0
@@ -264,10 +266,15 @@ class AcpClient:
             kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         else:
             kw["start_new_session"] = True  # 讓 close 能整個程序群組一起結束
+        spawn_cwd = (
+            None
+            if (len(self.cmd) > 3 and self.cmd[1:3] == ["-u", "-c"] and "REMOTE_STUB" in self.cmd[3] and not os.path.isdir(self.cwd))
+            else self.cwd
+        )
         try:
             self._proc = subprocess.Popen(
                 self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, cwd=self.cwd, env=env,
+                stderr=subprocess.PIPE, cwd=spawn_cwd, env=env,
                 text=True, encoding="utf-8", errors="replace", bufsize=1, **kw)
         except OSError as e:
             self._death = "無法啟動代理：%s" % e
@@ -372,10 +379,28 @@ class AcpClient:
             if death:
                 raise AcpError(death)
             raise
-        if not slot.done.wait(timeout):
+        self._last_activity = time.monotonic()
+        if method == "session/prompt":
+            started = time.monotonic()
+            idle_limit = float(timeout)
+            max_total = max(idle_limit * 4.0, 1800.0)
+            while True:
+                now = time.monotonic()
+                idle_rem = idle_limit - (now - self._last_activity)
+                total_rem = max_total - (now - started)
+                rem = min(idle_rem, total_rem)
+                if rem <= 0:
+                    with self._lock:
+                        self._pending.pop(rid, None)
+                    if total_rem <= 0:
+                        raise AcpError("代理執行超過總上限 %s 秒" % _secs(max_total))
+                    raise AcpError("代理在 %s 秒內沒有回應或任何活動" % _secs(timeout))
+                if slot.done.wait(min(2.0, rem)):
+                    break
+        elif not slot.done.wait(timeout):
             with self._lock:
                 self._pending.pop(rid, None)
-            raise AcpError("代理在 %s 秒內沒有回應" % _secs(timeout))
+            raise AcpError("代理在 %s 秒內沒有回應（%s）" % (_secs(timeout), method))
         if slot.error is not None:
             raise AcpError(slot.error)
         return slot.result
@@ -404,6 +429,7 @@ class AcpClient:
         params = msg.get("params") or {}
         if rid is None:
             if method == "session/update":
+                self._last_activity = time.monotonic()
                 self._note_usage(params.get("update") or {})
                 ev = self._to_event(params.get("update") or {})
                 if ev is not None:
@@ -412,6 +438,7 @@ class AcpClient:
                     self._events.put(ev)
             return
         if method == "session/request_permission":
+            self._last_activity = time.monotonic()
             with self._lock:
                 self._perm_open.add(rid)
             threading.Thread(target=self._permission_worker, args=(rid, params),
@@ -495,11 +522,16 @@ class AcpClient:
     def _permission_worker(self, rid: Any, params: Dict[str, Any]) -> None:
         tc = params.get("toolCall") or {}
         raw = tc.get("rawInput")
+        raw_dict = dict(raw) if isinstance(raw, dict) else {}
+        if isinstance(tc.get("locations"), list) and "locations" not in raw_dict:
+            raw_dict["locations"] = tc.get("locations")
+        if isinstance(tc.get("content"), list) and "content" not in raw_dict:
+            raw_dict["content"] = tc.get("content")
         req = PermissionRequest(
             tool_call_id=str(tc.get("toolCallId", "")),
             title=str(tc.get("title") or ""),
             kind=str(tc.get("kind") or "other"),
-            raw_input=raw if isinstance(raw, dict) else {},
+            raw_input=raw_dict,
             options=[o for o in (params.get("options") or []) if isinstance(o, dict)],
         )
         # 先讓之前的事件（例如 tool_call）送到 on_event

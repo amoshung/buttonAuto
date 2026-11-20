@@ -1,11 +1,11 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import PixelOfficeApp from '@/components/PixelOfficeApp';
-import { officeApi } from '@/lib/api';
+import PixelOfficeApp, { teamStateToSnapshot } from '@/components/PixelOfficeApp';
+import { teamApi } from '@/lib/api';
 import type { OfficeSnapshot } from '@/lib/types';
 
-// 靜態輸出：初始資料改在瀏覽器向 AI 工程助理取得，之後由 SSE 即時更新
+// 靜態輸出：初始資料改在瀏覽器向 /api/team/state 取得，之後由 SSE /api/stream 即時更新
 export default function HomePage() {
   const [initial, setInitial] = useState<OfficeSnapshot | null>(null);
   const [failed, setFailed] = useState(false);
@@ -13,9 +13,9 @@ export default function HomePage() {
   useEffect(() => {
     let alive = true;
     const load = async () => {
-      const snap = await officeApi.state();
+      const team = await teamApi.state();
       if (!alive) return;
-      if (snap) setInitial(snap);
+      if (team) setInitial(teamStateToSnapshot(team));
       else setFailed(true);
     };
     void load();
@@ -27,7 +27,7 @@ export default function HomePage() {
   if (!initial) {
     return (
       <div className="h-screen w-screen flex items-center justify-center bg-[#12141c] text-sm text-slate-400">
-        {failed ? '連不上 AI 工程助理：請從助理主視窗的「🌐」按鈕重新打開。' : '正在進入辦公室…'}
+        {failed ? '連不上 AI 工程助理：請從助理主視窗重新打開。' : '正在進入辦公室…'}
       </div>
     );
   }

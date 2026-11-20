@@ -21,6 +21,7 @@ from team.clis import CliInfo, launch_cmd
 from team.events import AgentEvent, PermissionRequest
 from team.headless import HeadlessClaude
 from team.secrets import SecretEnv
+from team.ssh import with_ssh_askpass_env, wrap_remote_stdio_cmd
 
 MODELS_WAIT = 3.0  # 等代理回報可用模型的上限（秒）
 SEATS = ("kiro", "agy", "claude", "glm", "glm_high")
@@ -184,23 +185,31 @@ def make_driver(cli: CliInfo, cwd: str, on_event: Callable[[AgentEvent], None],
                 on_permission: Callable[[PermissionRequest], str], read_only: bool,
                 cmd_override: Optional[List[str]] = None,
                 env: Optional[Dict[str, str]] = None, extra_args: Sequence[str] = (),
-                model: str = "", allowed_tools: Sequence[str] = ()) -> Driver:
+                model: str = "", allowed_tools: Sequence[str] = (),
+                ssh_host: str = "") -> Driver:
     """acp → AcpDriver（start = initialize + session/new [+ set_model]）；
     headless → HeadlessDriver（read_only 用 plan 模式；model 非空加 --model；
     allowed_tools 是寫入座位額外放行的 Bash 樣式，例如房間的測試指令）。"""
     cmd = list(cmd_override) if cmd_override else launch_cmd(cli)
-    env = with_cert_env(env)
+    if ssh_host:
+        eff_env = SecretEnv(with_ssh_askpass_env(ssh_host, {}))
+        eff_env.update(env or {})
+    else:
+        eff_env = with_cert_env(env)
     if cli.protocol == "acp":
-        return AcpDriver(cmd + list(extra_args), cwd, cli.label, on_event, on_permission,
-                         env=env, model=model)
+        full_cmd, _ = wrap_remote_stdio_cmd(ssh_host, cwd, cmd + list(extra_args), kill_on_eof=True)
+        return AcpDriver(full_cmd, cwd, cli.label, on_event, on_permission,
+                         env=eff_env, model=model)
+    base_cmd, _ = wrap_remote_stdio_cmd(ssh_host, cwd, cmd, kill_on_eof=False)
     extra = list(extra_args) + (["--model", model] if model else [])
-    return HeadlessDriver(HeadlessClaude(cmd, cwd, on_event, read_only, env=env,
+    return HeadlessDriver(HeadlessClaude(base_cmd, cwd, on_event, read_only, env=eff_env,
                                          extra_args=extra, allowed_tools=allowed_tools), cli.label)
 
 
 def seat_launch(seat: str, clis: Dict[str, CliInfo], cfg: Optional[Any],
                 plugin_dirs: Sequence[str], worktree: str,
-                tmpdir: str) -> Tuple[CliInfo, Dict[str, Optional[str]], List[str]]:
+                tmpdir: str, reference_root: str = "",
+                ssh_host: str = "") -> Tuple[CliInfo, Dict[str, Optional[str]], List[str]]:
     """cfg 需有 base_url、glm_key、glm_model（ModelConfig）；glm 座位以外可為 None。
 
     回傳的 env（SecretEnv）是覆蓋值：值為 None 表示「從子程序環境移除」（GLM 座位用來去掉
@@ -228,9 +237,19 @@ def seat_launch(seat: str, clis: Dict[str, CliInfo], cfg: Optional[Any],
             env["MAX_THINKING_TOKENS"] = "16000"
     env["DISABLE_AUTO_COMPACT"] = "1"
     extra = []  # type: List[str]
-    for d in plugin_dirs:
+    if ssh_host:
+        if reference_root:
+            extra += ["--add-dir", reference_root]
+        return clis["claude"], env, extra
+    all_plugins = list(plugin_dirs or [])
+    default_ce_plugin = os.path.join(os.path.expanduser("~"), ".gemini", "config", "ce-plugin")
+    if os.path.isdir(default_ce_plugin) and default_ce_plugin not in all_plugins:
+        all_plugins.append(default_ce_plugin)
+    for d in all_plugins:
         if d and os.path.exists(d):
             extra += ["--plugin-dir", d]
+    if reference_root and os.path.isdir(reference_root):
+        extra += ["--add-dir", os.path.abspath(reference_root)]
     uvx = shutil.which("uvx")
     if uvx:
         os.makedirs(tmpdir, exist_ok=True)

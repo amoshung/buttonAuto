@@ -201,6 +201,22 @@ class Assignment:
     model_by: str = ""  # 模型是你指定的：room（房間設定）｜global（設定頁座位模型）；要先驗證在可用清單裡
 
 
+def classify_complexity(task_text: str, phase: str = "build", retry_count: int = 0) -> str:
+    """依重試次數、階段與關鍵字將任務分級：simple / medium / complex。"""
+    if retry_count >= 2:
+        return "complex"
+    text = (task_text or "").lower()
+    complex_kw = ("重構", "refactor", "架構", "architecture", "安全", "security", "競態", "race", "跨多檔", "multi-file", "migration")
+    if any(k in text for k in complex_kw):
+        return "complex"
+    simple_kw = ("錯字", "typo", "copy", "文案", "readme", "comment", "註解", "config", "設定")
+    if phase == "fix" and retry_count == 0:
+        return "simple"
+    if any(k in text for k in simple_kw) and len(text) < 120:
+        return "simple"
+    return "medium"
+
+
 def phase_tier(phase: str, p_complex: float) -> str:
     """附錄 A2 第 3 點：實作依難度；小修正 economy；其餘 standard。"""
     if phase in ("build", "implement"):
@@ -293,7 +309,8 @@ class Dispatcher:
         return {"glm_high": "glm_high", "glm_normal": "glm"}.get(mode, "")
 
     def pick(self, phase: str, task_text: str, exclude: str = "", user_seat: str = "",
-             ctx: Optional[Dict[str, Any]] = None, user_model: str = "", use_global: bool = True) -> Assignment:
+             ctx: Optional[Dict[str, Any]] = None, user_model: str = "", use_global: bool = True,
+             retry_count: int = 0) -> Assignment:
         """ctx：{room_id}（給模型呼叫紀錄用；角色固定為 dispatcher）。user_model 只在 user_seat 有給時有效。
         use_global=False：這間房不用設定頁的座位模型（房間「改回自動」）。"""
         feas = self.feasible(exclude)
@@ -311,12 +328,16 @@ class Dispatcher:
         if not feas:
             raise NoSeatError(NO_AUTO_SEAT)
 
+        hint = classify_complexity(task_text, phase=phase, retry_count=retry_count)
+        if phase == "fix" and retry_count == 0 and hint == "simple" and "glm" in feas:
+            return self._assign("glm", "economy", "rule", "規則：簡單修正優先使用免費 GLM", use_global=use_global)
+
         # 判斷模型只要回一次 None（不可用）就停止追問，直接依規則選，避免模型掛掉時逐座位等逾時。
         models_down = False
-        p_complex = 0.5
+        p_complex = 0.85 if retry_count >= 2 else 0.5
         head = ""
         seen = []  # type: List[Tuple[str, str]]
-        if phase in ("build", "implement"):
+        if phase in ("build", "implement") and retry_count < 2:
             p = self._prob(task_text, COMPLEX_QUESTION, ctx, "派工：評估任務難度", seen)
             if p is None:
                 models_down = True

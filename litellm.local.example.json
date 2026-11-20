@@ -1,0 +1,14 @@
+{
+  "base_url": "http://172.22.119.193:4000",
+  "key": "YOUR_LITELLM_API_KEY",
+  "decision1_key": "YOUR_DECISION1_KEY",
+  "glm_model": "glm-5.3",
+  "d1_model": "Decision-1",
+  "sovereign_base_url": "",
+  "sovereign_key": "",
+  "embedding_model": "qwen3-embedding",
+  "embedding_dim": 2560,
+  "rerank_model": "bge-reranker-v2-m3",
+  "wiki_base_url": "",
+  "wiki_key": ""
+}

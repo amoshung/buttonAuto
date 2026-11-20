@@ -5,13 +5,18 @@ title AI Engineering Assistant - restart
 
 rem Same Python lookup as the old run.bat
 set "PY_EXE="
+set "PYW_EXE="
 if exist "C:\Program Files\Python313\python.exe" (
     set "PY_EXE=C:\Program Files\Python313\python.exe"
+    if exist "C:\Program Files\Python313\pythonw.exe" set "PYW_EXE=C:\Program Files\Python313\pythonw.exe"
 ) else if exist "C:\ProgramData\miniconda3\python.exe" (
     set "PY_EXE=C:\ProgramData\miniconda3\python.exe"
+    if exist "C:\ProgramData\miniconda3\pythonw.exe" set "PYW_EXE=C:\ProgramData\miniconda3\pythonw.exe"
 ) else (
     set "PY_EXE=python"
+    set "PYW_EXE=pythonw"
 )
+if "%PYW_EXE%"=="" set "PYW_EXE=%PY_EXE%"
 
 rem When the web console's "restart" button calls us, the browser tab is already open
 set "OPEN_FLAG=--open"
@@ -33,8 +38,8 @@ if errorlevel 1 (
     )
 )
 
-echo [3/4] Starting the backend in a minimized window "AI Assistant Backend"...
-start "AI Assistant Backend" /min "%PY_EXE%" "%~dp0server.py" %OPEN_FLAG%
+echo [3/4] Starting the backend hidden in background (no console window)...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%PYW_EXE%' -ArgumentList '\"%~dp0server.py\"', '%OPEN_FLAG%' -WorkingDirectory '%~dp0' -WindowStyle Hidden"
 
 echo [4/4] Waiting for the web console...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\assistant_ctl.ps1" wait
@@ -42,5 +47,5 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-timeout /t 4 >nul
+timeout /t 2 >nul
 exit /b 0

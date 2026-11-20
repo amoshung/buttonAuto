@@ -275,3 +275,22 @@ def test_auto_never_picks_kiro_or_agy(tmp_path):
         d2.pick("build", "x")
     assert str(ei.value) == NO_AUTO_SEAT
     assert d2.pick("build", "x", user_seat="kiro").seat == "kiro"
+
+
+def test_simple_fix_routes_to_glm_without_model_call(tmp_path):
+    from team.fleet import classify_complexity
+    assert classify_complexity("修好 README 錯字", phase="fix", retry_count=0) == "simple"
+    assert classify_complexity("修好錯字", phase="build", retry_count=2) == "complex"
+    router = FakeRouter(complex_p=0.9, seat_p={"claude": 0.99, "glm": 0.1})
+    d, _ = _disp(tmp_path, router)
+    a = d.pick("fix", "修好錯字", retry_count=0)
+    assert a.seat == "glm" and a.model == "glm-5.3" and a.by == "rule"
+    assert router.questions == []
+
+
+def test_retry_escalation_forces_premium_tier(tmp_path):
+    router = FakeRouter(complex_p=0.1, seat_p={"claude": 0.95, "glm": 0.2})
+    d, _ = _disp(tmp_path, router)
+    a = d.pick("build", "修好錯字", retry_count=2)
+    assert a.tier == "premium" and a.seat == "claude"
+    assert COMPLEX_Q not in router.questions

@@ -86,9 +86,15 @@ class Room:
     review_by: str = ""
     impl_reason: str = ""  # 派工理由（Decision-1 的分數或規則）
     review_reason: str = ""
-    # Task 18：這間房你指定的（座位＋模型）：{"seat", "model"}；空＝自動。座位同步寫在 impl_cli／review_cli。
+    # Task 18：這間房你指定的（座位＋模型）：{"seat", "model"}；空＝自動。座位同步寫在 impl_cli／review_cli／supervisor_cli。
     impl_pref: Dict[str, str] = field(default_factory=dict)
     review_pref: Dict[str, str] = field(default_factory=dict)
+    supervisor_cli: str = "auto"
+    supervisor_seat: str = ""
+    supervisor_model: str = ""
+    supervisor_model_actual: str = ""
+    supervisor_pref: Dict[str, str] = field(default_factory=dict)
+    role_prefs: Dict[str, Dict[str, str]] = field(default_factory=dict)
     # Task 17：CLI 回報的實際模型 id（沒回報＝""，畫面顯示「CLI 預設（未回報）」）與本房各座位累計用量
     impl_model_actual: str = ""
     review_model_actual: str = ""
@@ -100,6 +106,7 @@ class Room:
     rollovers: int = 0
     # 控制器追加
     target_branch: str = ""
+    checkpoint_stale: bool = False
     unverified: str = ""
     pending_fix: str = ""  # 關卡沒過、還沒送給代理的修正提示（重啟後先送它，不重跑關卡）
     # Task 20：代管（原本要你按的事改由 Decision-1 與審查模型決定；合併、危險指令、登入仍歸你）
@@ -114,11 +121,52 @@ class Room:
     env_accepted: List[str] = field(default_factory=list)
     user_info: str = ""
     notes_dir: str = ""
+    reference_root: str = ""
+    target_subdir: str = ""
+    target_subdirs: List[str] = field(default_factory=list)
+    ssh_host: str = ""
+    question_streak: int = 0
     capabilities: Optional[List[str]] = None
     caps_loaded: Dict[str, str] = field(default_factory=dict)
     lessons_used: List[str] = field(default_factory=list)
     autotune: Dict = field(default_factory=dict)
     stuck_reason: str = ""
+    # v2 LangGraph StateGraph + Decision-1 128 題打包引擎欄位
+    engine_version: str = "v2"
+    task_mode: str = "standard"  # "standard" | "triage"
+    d1_fast_review: bool = True
+    use_worktree: bool = False
+    graph_node: str = ""
+    current_unit_id: str = ""
+    selected_plan_rel: str = ""
+    unit_artifacts: Dict[str, Any] = field(default_factory=dict)
+
+
+def normalize_target_subdirs(
+    target_subdir: str = "",
+    target_subdirs: Optional[List[str]] = None,
+) -> List[str]:
+    """正規化單一或複數目標子資料夾（如 ['frontend', 'backend'] 或 'frontend, backend'），去重並統一為正斜線。"""
+    raw_items: List[str] = []
+    if isinstance(target_subdirs, (list, tuple)):
+        for item in target_subdirs:
+            if isinstance(item, str):
+                for part in re.split(r"[,;]+", item):
+                    raw_items.append(part)
+    if isinstance(target_subdir, str) and target_subdir.strip():
+        for part in re.split(r"[,;]+", target_subdir):
+            raw_items.append(part)
+    out: List[str] = []
+    seen = set()
+    for p in raw_items:
+        clean = p.strip().replace("\\", "/").strip("/")
+        if not clean:
+            continue
+        key = clean.lower() if os.name == "nt" else clean
+        if key not in seen:
+            seen.add(key)
+            out.append(clean)
+    return out
 
 
 def _from_dict(cls, d: Dict[str, Any]):

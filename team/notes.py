@@ -6,6 +6,7 @@ from typing import List, Sequence
 
 from team import gitops
 from team.gitops import GitError, Worktree
+from team.ssh import remote_fs
 
 LEGACY_DOC_DIRS: Sequence[str] = ("docs/ai-team",)
 PURGE_COMMIT_MSG = "ai-team: 移除助理工作文件"
@@ -21,10 +22,10 @@ def _norm_dirs(dirs: Sequence[str]) -> List[str]:
     return out
 
 
-def notes_dir(repo: str, slug: str) -> str:
-    """回傳並建立 repo 外的房間工作文件目錄：<repo 上一層>/.ai-team-worktrees/<repo 名>-<slug>.notes。"""
+def notes_dir(repo: str, slug: str, in_place: bool = False) -> str:
+    """回傳並建立房間工作文件目錄：預設在 <repo 上一層>/.ai-team-worktrees/；若為子資料夾 B 獨立模式則建在 B/.ai-team-worktrees/ 內，不碰母資料夾 A。"""
     abs_repo = os.path.abspath(repo)
-    root = os.path.join(os.path.dirname(abs_repo), gitops.WT_DIR)
+    root = gitops.worktree_root(abs_repo, in_place=in_place)
     name = os.path.basename(abs_repo)
     path = os.path.join(root, "%s-%s.notes" % (name, slug))
     os.makedirs(path, exist_ok=True)
@@ -40,6 +41,8 @@ def mirror(notes: str, room_dir: str) -> None:
         if os.path.basename(os.path.normpath(room_dir)) == "notes"
         else os.path.join(room_dir, "notes")
     )
+    if os.path.abspath(notes) == os.path.abspath(dst_root):
+        return
     os.makedirs(dst_root, exist_ok=True)
     for dirpath, _dirnames, filenames in os.walk(notes):
         rel_dir = os.path.relpath(dirpath, notes)
@@ -118,33 +121,65 @@ def purge_worktree(
     - 未追蹤 → 直接移除
     回傳移除的相對路徑清單。
     """
-    if not wt or not wt.path or not os.path.isdir(wt.path):
+    if not wt or not wt.path:
+        return []
+    ssh_host = getattr(wt, "ssh_host", "") or ""
+    if not ssh_host and not os.path.isdir(wt.path):
         return []
     os.makedirs(notes, exist_ok=True)
     legacy_root = os.path.join(notes, "legacy")
     removed: List[str] = []
     for rel in _norm_dirs(dirs):
-        full = os.path.join(wt.path, rel.replace("/", os.sep))
         try:
-            tracked = gitops.git(wt.path, "ls-files", "--", rel).strip()
+            tracked = gitops.git(wt.path, "ls-files", "--", rel, ssh_host=ssh_host).strip()
         except GitError:
             tracked = ""
-        exists = os.path.exists(full)
-        if not tracked and not exists:
-            continue
-        if exists:
-            _copy_tree_into(full, legacy_root, notes_root=notes)
+        if ssh_host:
+            try:
+                res = remote_fs(ssh_host, "purge_dir", wt.path, rel=rel)
+            except Exception:
+                res = {"exists": False, "files": {}}
+            exists = bool(res.get("exists"))
+            if not tracked and not exists:
+                continue
+            files = res.get("files") or {}
+            for rpath, content in files.items():
+                dst = os.path.join(legacy_root, rpath.replace("/", os.sep))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                try:
+                    with open(dst, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(str(content))
+                except OSError:
+                    pass
+                fn = os.path.basename(rpath)
+                if fn in _NOTE_NAMES:
+                    top_note = os.path.join(notes, fn)
+                    if not os.path.exists(top_note):
+                        try:
+                            with open(top_note, "w", encoding="utf-8", newline="\n") as f:
+                                f.write(str(content))
+                        except OSError:
+                            pass
+        else:
+            full = os.path.join(wt.path, rel.replace("/", os.sep))
+            exists = os.path.exists(full)
+            if not tracked and not exists:
+                continue
+            if exists:
+                _copy_tree_into(full, legacy_root, notes_root=notes)
         if tracked:
             try:
-                gitops.git(wt.path, "rm", "-r", "-f", "--cached", "--", rel)
+                gitops.git(wt.path, "rm", "-r", "-f", "--cached", "--", rel, ssh_host=ssh_host)
             except GitError:
                 pass
-        if os.path.exists(full):
-            _rmtree_force(full)
-            _prune_empty_parents(wt.path, rel)
+        if not ssh_host:
+            full = os.path.join(wt.path, rel.replace("/", os.sep))
+            if os.path.exists(full):
+                _rmtree_force(full)
+                _prune_empty_parents(wt.path, rel)
         if tracked:
             try:
-                staged = gitops.git(wt.path, "diff", "--cached", "--name-only", "--", rel).strip()
+                staged = gitops.git(wt.path, "diff", "--cached", "--name-only", "--", rel, ssh_host=ssh_host).strip()
                 if staged:
                     gitops.git(
                         wt.path,
@@ -156,6 +191,7 @@ def purge_worktree(
                         PURGE_COMMIT_MSG,
                         "--",
                         rel,
+                        ssh_host=ssh_host,
                     )
             except GitError:
                 pass

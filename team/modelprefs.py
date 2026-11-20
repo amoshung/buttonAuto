@@ -27,6 +27,7 @@ from team.usage import now_iso
 log = logging.getLogger(__name__)
 
 ACP_SEATS = ("kiro", "agy")
+DETECTABLE_SEATS = ("kiro", "agy", "claude")
 # 使用者決定：Decision-1 自動派工只在這些座位裡選；Kiro／Antigravity 只在你指定時使用
 AUTO_SEATS = ("claude", "glm", "glm_high")
 AUTO_LABEL = "自動（Decision-1 在 Claude／GLM 中選）"
@@ -35,6 +36,130 @@ GLM_SEATS = ("glm", "glm_high")
 TIERS = ("economy", "standard", "premium")
 TIER_COST = {"economy": 1, "standard": 3, "premium": 15}
 CLAUDE_ALIASES = ("haiku", "sonnet", "opus")
+CLAUDE_DETECTED_MODELS: Tuple[Dict[str, str], ...] = (
+    {"id": "opus", "name": "opus（Claude 最新旗艦別名）", "description": "高階深度推理 Claude 模型"},
+    {"id": "sonnet", "name": "sonnet（Claude 最新標準別名）", "description": "標準平衡型 Claude 模型"},
+    {"id": "haiku", "name": "haiku（Claude 最新輕量別名）", "description": "快速經濟型 Claude 模型"},
+    {"id": "fable", "name": "fable（Claude Fable 別名）", "description": "Claude Code CLI Fable 系列別名"},
+    {"id": "claude-opus-5-5", "name": "claude-opus-5-5", "description": "Claude Opus 5.5 旗艦模型"},
+    {"id": "claude-sonnet-5-5", "name": "claude-sonnet-5-5", "description": "Claude Sonnet 5.5 主力模型"},
+    {"id": "claude-haiku-5-5", "name": "claude-haiku-5-5", "description": "Claude Haiku 5.5 高速模型"},
+    {"id": "claude-fable-5-2", "name": "claude-fable-5-2", "description": "Claude Fable 5.2 模型"},
+    {"id": "claude-opus-5", "name": "claude-opus-5", "description": "Claude Opus 5 模型"},
+    {"id": "claude-sonnet-5", "name": "claude-sonnet-5", "description": "Claude Sonnet 5 模型"},
+    {"id": "claude-sonnet-4-6", "name": "claude-sonnet-4-6", "description": "Claude Sonnet 4.6 模型"},
+    {"id": "claude-opus-4-6", "name": "claude-opus-4-6", "description": "Claude Opus 4.6 模型"},
+    {"id": "claude-sonnet-4-5", "name": "claude-sonnet-4-5", "description": "Claude Sonnet 4.5 模型"},
+    {"id": "claude-opus-4-5", "name": "claude-opus-4-5", "description": "Claude Opus 4.5 模型"},
+    {"id": "claude-haiku-4-5", "name": "claude-haiku-4-5", "description": "Claude Haiku 4.5 模型"},
+)
+
+_SKIP_GATEWAY_MODELS = re.compile(
+    r"(?:^gemma|muse-glimmer|^moa|^gpt-oss|embed|transcribe|safeguard|vision|image|^Decision-1$)",
+    re.I,
+)
+
+
+def probe_claude_models(cli_path: str = "", settings_path: str = "") -> Dict[str, Any]:
+    """動態探測 Claude CLI 可用模型：
+    1. 讀取 ~/.claude/settings.json（model、modelSettings、ANTHROPIC_BASE_URL /v1/models）
+    2. 掃描 claude 執行檔內建支援的 claude-* 模型代號
+    3. 合併別名與完整模型清單回傳 {"models": [...], "current": ...}
+    """
+    import urllib.request
+
+    seen = set()
+    out: List[Dict[str, str]] = []
+    current = "sonnet"
+
+    def _add(mid: str, name: str = "", desc: str = "") -> None:
+        m = (mid or "").strip()
+        if not m or m in seen or _SKIP_GATEWAY_MODELS.search(m):
+            return
+        seen.add(m)
+        out.append({"id": m, "name": name or m, "description": desc})
+
+    for base_m in CLAUDE_DETECTED_MODELS:
+        _add(base_m["id"], base_m["name"], base_m["description"])
+
+    spath = settings_path or os.path.expanduser("~/.claude/settings.json")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if os.path.isfile(spath):
+        try:
+            with open(spath, encoding="utf-8") as f:
+                sdata = json.load(f)
+            if isinstance(sdata, dict):
+                if isinstance(sdata.get("model"), str) and sdata["model"].strip():
+                    current = sdata["model"].strip()
+                    _add(current, current, "Claude settings.json 預設模型")
+                env_cfg = sdata.get("env")
+                if isinstance(env_cfg, dict):
+                    base_url = base_url or str(env_cfg.get("ANTHROPIC_BASE_URL") or "").strip()
+                    auth_token = auth_token or str(
+                        env_cfg.get("ANTHROPIC_AUTH_TOKEN") or env_cfg.get("ANTHROPIC_API_KEY") or ""
+                    ).strip()
+                mset = sdata.get("modelSettings")
+                if isinstance(mset, dict):
+                    for mid in mset:
+                        _add(str(mid), str(mid), "Claude settings.json 已配置模型")
+        except Exception:
+            pass
+
+    # 若設定了 ANTHROPIC_BASE_URL，向閘道 /v1/models 查詢即時可用模型
+    if base_url and base_url.startswith(("http://", "https://")):
+        try:
+            url = base_url.rstrip("/") + "/v1/models"
+            headers = {"Accept": "application/json"}
+            if auth_token:
+                headers["Authorization"] = f"Bearer {auth_token}"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            raw_ids = [
+                str(item.get("id") or "").strip()
+                for item in (payload.get("data") or [])
+                if isinstance(item, dict) and item.get("id")
+            ]
+            # 優先排列 claude-* 與主力開發模型
+            claude_first = sorted(
+                raw_ids,
+                key=lambda x: (
+                    0 if x.startswith("claude-") else (1 if x.startswith(("gpt-", "gemini-", "glm-")) else 2),
+                    x,
+                ),
+            )
+            for mid in claude_first:
+                _add(mid, mid, "Claude Gateway 可用模型")
+        except Exception:
+            pass
+
+    # 掃描 claude CLI 執行檔內建的世代模型名稱（依 mtime 快取避免重覆讀取大型執行檔）
+    if cli_path and os.path.isfile(cli_path):
+        try:
+            cache_key = (os.path.normcase(os.path.abspath(cli_path)), int(os.stat(cli_path).st_mtime))
+            found = _CLAUDE_BIN_CACHE.get(cache_key)
+            if found is None:
+                with open(cli_path, "rb") as f:
+                    blob = f.read(60 * 1024 * 1024)
+                found = sorted(
+                    {
+                        m.decode("ascii")
+                        for m in re.findall(rb"claude-(?:opus|sonnet|haiku|fable)-[0-9a-z.-]{1,24}", blob)
+                    },
+                    reverse=True,
+                )
+                _CLAUDE_BIN_CACHE[cache_key] = found
+            for mid in found:
+                if not mid.endswith("-") and not re.search(r"-202\d", mid):
+                    _add(mid, mid, "Claude CLI 內建模型")
+        except Exception:
+            pass
+
+    return {"models": out[:MAX_MODELS], "current": current}
+
+
+_CLAUDE_BIN_CACHE: Dict[Tuple[str, int], List[str]] = {}
 MAX_ID = 120
 MAX_MODELS = 60
 
@@ -229,7 +354,15 @@ class ModelPrefs:
             if seat in GLM_SEATS:
                 return [dict(e) for e in DEFAULT_CATALOG[seat]]
             if seat == "claude":
-                ids = list(CLAUDE_ALIASES) + [i for i in stored if i not in CLAUDE_ALIASES]
+                c = self._cache.get("claude") or {}
+                cached_ids = [m["id"] for m in c.get("models") or [] if m.get("id")]
+                ids = list(CLAUDE_ALIASES)
+                for i in cached_ids:
+                    if i not in ids:
+                        ids.append(i)
+                for i in stored:
+                    if i not in ids:
+                        ids.append(i)
             else:
                 c = self._cache.get(seat) or {}
                 ids = [m["id"] for m in c.get("models") or []]
@@ -267,7 +400,7 @@ class ModelPrefs:
         cache = {}
         if isinstance(data, dict):
             for s, v in data.items():
-                if s in ACP_SEATS and isinstance(v, dict) and v.get("models"):  # 只有錯誤、沒有清單的舊紀錄不留
+                if s in DETECTABLE_SEATS and isinstance(v, dict) and v.get("models"):  # 只有錯誤、沒有清單的舊紀錄不留
                     cache[s] = {"models": [m for m in (self._norm_detected(x) for x in v.get("models") or [])
                                            if m is not None],
                                 "current": str(v.get("current") or "")[:MAX_ID],
@@ -325,9 +458,17 @@ class ModelPrefs:
             return [{"id": g, "name": g, "description": "一般思考量" if seat == "glm" else "高思考量"}]
         with self._lock:
             if seat == "claude":
-                ids = list(CLAUDE_ALIASES) + [e["id"] for e in self._models.get("claude", [])
-                                               if e["id"] and e["id"] not in CLAUDE_ALIASES]
-                return [{"id": i, "name": i, "description": "別名（最新版）" if i in CLAUDE_ALIASES else "完整 id"}
+                c = self._cache.get("claude") or {}
+                cached_map = {m["id"]: dict(m) for m in (c.get("models") or []) if m.get("id")}
+                ids = list(CLAUDE_ALIASES)
+                for i in cached_map:
+                    if i not in ids:
+                        ids.append(i)
+                for e in self._models.get("claude", []):
+                    if e["id"] and e["id"] not in ids:
+                        ids.append(e["id"])
+                return [cached_map.get(i) or {"id": i, "name": i,
+                                              "description": "別名（最新版）" if i in CLAUDE_ALIASES else "完整 id"}
                         for i in ids]
             c = self._cache.get(seat)
             if not c or not c.get("models"):
@@ -355,7 +496,7 @@ class ModelPrefs:
     # ---- 寫入 ----
     def note_detected(self, seat: str, models: List[Any], current: str = "", error: str = "") -> None:
         """記下偵測結果（或錯誤）。錯誤時保留上次成功的清單。"""
-        if seat not in ACP_SEATS:
+        if seat not in DETECTABLE_SEATS:
             return
         clean = [m for m in (self._norm_detected(x) for x in models or []) if m is not None][:MAX_MODELS]
         with self._lock:

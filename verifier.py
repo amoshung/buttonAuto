@@ -2,10 +2,11 @@
 
 用來交叉比對代理的測試報告：commit 是否真的存在、是否在功能分支、改了哪些檔、檔案裡有沒有空殼跡象。
 """
+import ast
 import os
 import re
 import subprocess
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # 只允許讀取類的 git 子指令
 _READONLY_GIT = {"rev-parse", "status", "cat-file", "show", "log", "diff", "branch"}
@@ -71,10 +72,65 @@ def claimed_hashes(report: str) -> List[str]:
     return out[:20]
 
 
+def _py_abstract_not_implemented_lines(text: str) -> Set[int]:
+    """回傳屬於 Python 抽象介面／基底類別方法的 raise NotImplementedError 行號，避免誤殺正規多型介面。"""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return set()
+    classes: List[ast.ClassDef] = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+    if not classes:
+        return set()
+    # 建立「基底類別名稱 -> 子類別覆寫過的方法集合」索引
+    overridden_by_base: Dict[str, Set[str]] = {}
+    for cls in classes:
+        methods = {
+            n.name for n in cls.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for base in cls.bases:
+            bname = base.id if isinstance(base, ast.Name) else (base.attr if isinstance(base, ast.Attribute) else "")
+            if bname:
+                overridden_by_base.setdefault(bname, set()).update(methods)
+
+    exempt: Set[int] = set()
+    for cls in classes:
+        base_names = {
+            (b.id if isinstance(b, ast.Name) else (b.attr if isinstance(b, ast.Attribute) else ""))
+            for b in cls.bases
+        }
+        is_abc = bool(base_names & {"ABC", "Protocol"}) or any(
+            kw.arg == "metaclass" and (
+                (isinstance(kw.value, ast.Name) and kw.value.id == "ABCMeta")
+                or (isinstance(kw.value, ast.Attribute) and kw.value.attr == "ABCMeta")
+            )
+            for kw in cls.keywords
+        )
+        sub_methods = overridden_by_base.get(cls.name, set())
+        for node in cls.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            has_abstract_dec = any(
+                (isinstance(d, ast.Name) and d.id == "abstractmethod")
+                or (isinstance(d, ast.Attribute) and d.attr == "abstractmethod")
+                for d in node.decorator_list
+            )
+            if not (is_abc or has_abstract_dec or node.name in sub_methods):
+                continue
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Raise) and sub.exc is not None:
+                    exc = sub.exc.func if isinstance(sub.exc, ast.Call) else sub.exc
+                    ename = exc.id if isinstance(exc, ast.Name) else (exc.attr if isinstance(exc, ast.Attribute) else "")
+                    if ename == "NotImplementedError":
+                        exempt.add(sub.lineno)
+    return exempt
+
+
 def scan_stubs(path: str, files: List[str], max_bytes: int = 400_000) -> List[Dict[str, str]]:
     hits: List[Dict[str, str]] = []
     for rel in files:
-        if os.path.splitext(rel)[1].lower() not in _TEXT_EXT:
+        ext = os.path.splitext(rel)[1].lower()
+        if ext not in _TEXT_EXT:
             continue
         full = os.path.join(path, rel)
         try:
@@ -83,10 +139,14 @@ def scan_stubs(path: str, files: List[str], max_bytes: int = 400_000) -> List[Di
             text = open(full, encoding="utf-8", errors="replace").read()
         except OSError:
             continue
+        exempt_not_impl = _py_abstract_not_implemented_lines(text) if ext == ".py" else set()
+        lines = text.splitlines()
         for label, pat in STUB_PATTERNS:
             for m in re.finditer(pat, text, re.M | re.I):
                 line_no = text.count("\n", 0, m.start()) + 1
-                line = text.splitlines()[line_no - 1].strip() if text.splitlines() else ""
+                if label == "NotImplemented" and line_no in exempt_not_impl:
+                    continue
+                line = lines[line_no - 1].strip() if lines else ""
                 hits.append({"file": rel.replace("\\", "/"), "line": str(line_no), "kind": label, "text": line[:120]})
                 if len(hits) >= 40:
                     return hits

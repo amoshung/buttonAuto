@@ -25,6 +25,7 @@ web_token.local
 .capture_*.json
 recon/
 litellm.local.json
+ssh_hosts.local.json
 # 使用者在主控台選的座位模型（本機設定）
 team_models.json
 .superpowers/

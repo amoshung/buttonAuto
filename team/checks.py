@@ -74,10 +74,33 @@ def _decode(data: bytes) -> str:
 
 def run_cmd(cwd: str, cmd: str, timeout: float = 600, env: Optional[Dict[str, str]] = None,
             cancel: Optional[threading.Event] = None, log_path: str = "",
-            secrets: Sequence[str] = ()) -> CmdResult:
+            secrets: Sequence[str] = (), ssh_host: str = "") -> CmdResult:
     """以 shell 執行；stdout 與 stderr 合併，只留最後 4000 字。逾時殺掉整個程序樹，exit_code=-1。
     cancel 被設定時也殺掉整個程序樹，回傳 cancelled=True、exit_code=-1（每 0.1 秒檢查一次）。"""
     start = time.monotonic()
+    if ssh_host:
+        if cancel is not None and cancel.is_set():
+            return CmdResult(cmd, -1, 0.0, False, "…（%s）" % CANCELLED, True)
+        from team.ssh import remote_exec
+        try:
+            res = remote_exec(ssh_host, cwd, cmd, shell=True, timeout=timeout, env=env)
+        except Exception as e:
+            return CmdResult(cmd, -1, time.monotonic() - start, False, "遠端無法執行指令：%s" % e)
+        if not res.get("ok"):
+            return CmdResult(cmd, -1, time.monotonic() - start, False, "遠端無法執行指令：%s" % res.get("error", ""))
+        timed_out = bool(res.get("timed_out"))
+        text = str(res.get("stdout") or "") + (("\n" + str(res.get("stderr"))) if res.get("stderr") else "")
+        if timed_out:
+            text += "\n…（逾時 %s 秒，已停止）" % timeout
+        if log_path:
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+                with open(log_path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(events.mask_text(text, secrets))
+            except OSError:
+                pass
+        code = -1 if timed_out else int(res.get("returncode", -1))
+        return CmdResult(cmd, code, time.monotonic() - start, timed_out, text[-TAIL_CHARS:], False)
     kw: Dict = {}
     if _IS_WIN:
         kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0) | \
@@ -146,7 +169,7 @@ def added_lines(wt: Worktree) -> Dict[str, Set[int]]:
     cur = ""
     for line in gitops.git(wt.path, "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "diff", "-U0",
                            "--no-renames", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/",
-                           wt.base)\
+                           wt.base, ssh_host=wt.ssh_host)\
             .splitlines():
         if line.startswith("+++ "):
             name = _unquote(line[4:])
@@ -172,6 +195,8 @@ def build_issues(wt: Worktree, allowed: List[str]) -> List[str]:
     outside = gitops.outside_allowed(files, allowed)
     if outside:
         issues.append("改到範圍外的檔案：" + "、".join(outside[:10]) + ("…" if len(outside) > 10 else ""))
+    if wt.ssh_host:
+        return issues
     added = added_lines(wt)
     untracked = set(gitops.git(wt.path, "ls-files", "--others", "--exclude-standard", "-z").split("\0")) - {""}
     stubs = 0
@@ -402,7 +427,7 @@ def test_gate(wt: Worktree, test_cmd: str, criteria: List[Dict[str, Any]],
         if c_str in cache:
             return cache[c_str]
         lp = os.path.join(log_dir, "gate-%d-%d.txt" % (gate_no, len(results) + 1)) if log_dir else ""
-        res = run_cmd(wt.path, c_str, cancel=cancel, log_path=lp, secrets=secrets)
+        res = run_cmd(wt.path, c_str, cancel=cancel, log_path=lp, secrets=secrets, ssh_host=wt.ssh_host)
         results.append(res)
         if lp and os.path.isfile(lp):
             logs.append(lp)
@@ -467,7 +492,7 @@ def test_gate(wt: Worktree, test_cmd: str, criteria: List[Dict[str, Any]],
             bad_r.exit_code if bad_r else 1,
         )
 
-    if tests_ok:  # 測試本身沒過時，換回原狀檢查沒有意義
+    if tests_ok and not wt.ssh_host:  # 測試本身沒過或遠端 SSH 模式時，不做本機換回原狀檢查
         if cancel is not None and cancel.is_set():
             return TestGate(False, [CANCELLED], results, "", True, logs=logs)
         mut_cmd = tcmd
@@ -520,7 +545,7 @@ def quick_check(
         if git_problem(check) or deny_hit(check, deny_patterns):
             continue
         if check not in cache:
-            r = run_cmd(wt.path, check, cancel=cancel)
+            r = run_cmd(wt.path, check, cancel=cancel, ssh_host=wt.ssh_host)
             if r.cancelled:
                 break
             cache[check] = r.exit_code
@@ -544,6 +569,123 @@ def is_test_path(path: str) -> bool:
         return True
     parts = p.split("/")
     return bool(_TEST_NAMES.match(parts[-1])) or any(seg.lower() in _TEST_DIRS for seg in parts[:-1])
+
+
+def _resolve_excluded_target_reals(
+    reference_root: str,
+    target_repo: str = "",
+    exclude_subdir: str = "",
+    exclude_subdirs: Sequence[str] = (),
+) -> List[str]:
+    """解析母資料夾 A 底下所有可讀寫的目標子資料夾實質路徑（支援單一或複數目標資料夾 B）。"""
+    ref_real = os.path.normcase(os.path.realpath(reference_root))
+    out: List[str] = []
+    subs: List[str] = []
+    for item in exclude_subdirs or ():
+        if isinstance(item, str):
+            subs.extend(p.strip() for p in re.split(r"[,;]+", item) if p.strip())
+    if exclude_subdir:
+        subs.extend(p.strip() for p in re.split(r"[,;]+", exclude_subdir) if p.strip())
+    for s in subs:
+        cand = os.path.join(reference_root, s.replace("\\", "/").strip("/"))
+        cand_real = os.path.normcase(os.path.realpath(cand))
+        if cand_real != ref_real and cand_real not in out:
+            out.append(cand_real)
+    if target_repo:
+        tgt_real = os.path.normcase(os.path.realpath(target_repo))
+        if tgt_real != ref_real and tgt_real not in out:
+            out.append(tgt_real)
+    # 永遠允許助理寫入 docs/ai-team 工作筆記與 progress.md
+    ai_docs = os.path.normcase(os.path.realpath(os.path.join(reference_root, "docs", "ai-team")))
+    if ai_docs not in out:
+        out.append(ai_docs)
+    return out
+
+
+def snapshot_reference_root(
+    reference_root: str,
+    target_repo: str = "",
+    max_files: int = 5000,
+    *,
+    exclude_subdir: str = "",
+    exclude_subdirs: Sequence[str] = (),
+) -> Dict[str, Tuple[int, int]]:
+    """對母資料夾 A（排除單一或複數目標子資料夾 B 與常見快取目錄）建立輕量 (size, mtime_ns) 快照，以確認唯讀參考區未被修改。"""
+    if not reference_root or not os.path.isdir(reference_root):
+        return {}
+    ref_real = os.path.normcase(os.path.realpath(reference_root))
+    tgt_reals = _resolve_excluded_target_reals(
+        reference_root,
+        target_repo=target_repo,
+        exclude_subdir=exclude_subdir,
+        exclude_subdirs=exclude_subdirs,
+    )
+    skip_dirs = {
+        ".git", ".ai-team-worktrees", ".ai-team-mutation",
+        ".codegraph", ".claude", ".cursor", ".kiro", ".gemini", ".codex",
+        ".vscode", ".idea", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+        "node_modules", "__pycache__", ".venv", "venv",
+    }
+    skip_suffixes = (".db-wal", ".db-shm", ".db-journal", ".lock", ".tmp")
+    snap: Dict[str, Tuple[int, int]] = {}
+
+    def _is_excluded(real_p: str) -> bool:
+        return any(real_p == t or real_p.startswith(t.rstrip(os.sep) + os.sep) for t in tgt_reals)
+
+    for dirpath, dirnames, filenames in os.walk(reference_root, followlinks=False):
+        cur_real = os.path.normcase(os.path.realpath(dirpath))
+        if _is_excluded(cur_real):
+            dirnames[:] = []
+            continue
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in skip_dirs
+            and not _is_excluded(os.path.normcase(os.path.realpath(os.path.join(dirpath, d))))
+        ]
+        for fn in filenames:
+            if len(snap) >= max_files:
+                return snap
+            fn_low = fn.lower()
+            if fn_low.endswith(skip_suffixes) or fn_low == "daemon.log":
+                continue
+            full = os.path.join(dirpath, fn)
+            try:
+                st = os.stat(full, follow_symlinks=False)
+                rel = os.path.relpath(os.path.realpath(full), ref_real).replace("\\", "/")
+                snap[rel] = (int(st.st_size), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))))
+            except OSError:
+                continue
+    return snap
+
+
+def verify_reference_untouched(
+    before: Any,
+    reference_root: Any = "",
+    target_repo: str = "",
+    *,
+    exclude_subdir: str = "",
+    exclude_subdirs: Sequence[str] = (),
+) -> List[str]:
+    """比對回合前後的母資料夾 A 快照；回傳所有在目標資料夾 B 以外被新增、刪除或修改的唯讀參考區相對路徑。"""
+    if isinstance(before, str) and isinstance(reference_root, dict):
+        reference_root, before = before, reference_root
+    if not reference_root or not isinstance(before, dict) or not before:
+        return []
+    after = snapshot_reference_root(
+        str(reference_root),
+        target_repo,
+        max_files=max(5000, len(before) + 500),
+        exclude_subdir=exclude_subdir,
+        exclude_subdirs=exclude_subdirs,
+    )
+    changed: List[str] = []
+    for k, v in before.items():
+        if after.get(k) != v:
+            changed.append(k)
+    for k in after:
+        if k not in before:
+            changed.append(k)
+    return sorted(set(changed))
 
 
 def _blob(wt: Worktree, rev: str, rel: str) -> Optional[bytes]:

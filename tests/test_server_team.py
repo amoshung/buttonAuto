@@ -71,7 +71,7 @@ def _req(app, path, body=None, cookie=True, token=True):
             headers["X-Token"] = TOKEN
     req = urllib.request.Request(f"http://127.0.0.1:{app.port}{path}", data=data, headers=headers)
     try:
-        with urllib.request.build_opener(_NoRedirect).open(req, timeout=20) as r:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=45) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
         return e.code, e.read()
@@ -519,5 +519,234 @@ def test_prompts_api_get_save_reset(srv):
     assert code == 200 and rst["ok"] is True and rst["prompts"]["roles"]["qa"]["version"] == "default"
     raw = json.dumps(rst, ensure_ascii=False)
     assert GLM_KEY not in raw and D1_KEY not in raw
+
+
+def test_pixel_preview_route_with_csp_nonce(srv, tmp_path, monkeypatch):
+    import urllib.request
+    px = tmp_path / "pixel_out"
+    (px / "_next" / "static").mkdir(parents=True)
+    (px / "index.html").write_text("<html><head></head><body><script>window.__OK=1;</script></body></html>", encoding="utf-8")
+    (px / "_next" / "static" / "app.js").write_text("console.log(1);", encoding="utf-8")
+    monkeypatch.setattr(server, "PIXEL_DIR", str(px))
+
+    # 未帶驗證 -> 401
+    req = urllib.request.Request(f"http://127.0.0.1:{srv.port}/pixel/")
+    try:
+        urllib.request.urlopen(req)
+        assert False, "expected 401"
+    except urllib.error.HTTPError as e:
+        assert e.code == 401
+
+    # 帶 ?t=TOKEN 取得 cookie 後讀取 /pixel/ 與 /_next/static/app.js
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+    r = opener.open(f"http://127.0.0.1:{srv.port}/pixel/?t={TOKEN}")
+    html = r.read().decode("utf-8")
+    csp = r.headers.get("Content-Security-Policy", "")
+    assert "aea-token" in html and TOKEN in html
+    assert "nonce-" in csp and 'nonce="' in html
+    js = opener.open(f"http://127.0.0.1:{srv.port}/_next/static/app.js").read().decode("utf-8")
+    assert "console.log(1)" in js
+
+
+def test_subfolder_b_scan_and_create_room_with_readonly_reference_a(srv, tmp_path):
+    srv.team.max_running_fn = lambda: 0
+    parent_a = tmp_path / "workspace_A"
+    sub_b = parent_a / "service_B"
+    sub_c = parent_a / "reference_C"
+    sub_b.mkdir(parents=True)
+    sub_c.mkdir(parents=True)
+    (sub_b / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (sub_c / "spec.txt").write_text("readonly ref\n", encoding="utf-8")
+
+    code, scan_res = J(srv, "/api/team/scan?path=" + urllib.request.quote(str(parent_a)))
+    assert code == 200
+    assert scan_res["subdirs"] == ["reference_C", "service_B"]
+
+    code, res = J(
+        srv,
+        "/api/team/rooms",
+        {
+            "repo": str(parent_a),
+            "target_subdir": "service_B",
+            "goal": "修改 service_B 並參考 reference_C",
+            "source": "goal",
+        },
+    )
+    assert code == 200 and res["ok"] is True, res
+    room = res["room"]
+    assert os.path.normcase(room["repo"]) == os.path.normcase(str(sub_b))
+    assert os.path.normcase(room["reference_root"]) == os.path.normcase(str(parent_a))
+    assert room["target_subdir"] == "service_B"
+    assert (sub_b / ".git").exists()
+    assert not (parent_a / ".git").exists()
+    assert not (sub_c / ".git").exists()
+
+
+def test_room_goal_sync_plan_reset_and_handoff_with_llm_wiki(srv, tmp_path):
+    srv.team.max_running_fn = lambda: 0
+    repo = tmp_path / "repo_ce"
+    git_repo(str(repo))
+    plans_dir = repo / "docs" / "plans"
+    plans_dir.mkdir(parents=True)
+    (plans_dir / "2026-11-18-feat-ce-plan.md").write_text(
+        "---\ntitle: CE Master Plan\ndate: 2026-11-18\n---\n\n"
+        "## Goal Capsule\n- **Objective:** 完成 CE 與 LLM Wiki 整合\n\n"
+        "## Implementation Units\n### U1: 建立 LLM Wiki\n### U2: 支援房間封存與接續開發\n",
+        encoding="utf-8",
+    )
+
+    code, created = J(srv, "/api/team/rooms", {"repo": str(repo), "goal": "初始目標", "source": "goal"})
+    assert code == 200 and created["ok"] is True
+    rid = created["room"]["id"]
+
+    # 1. 使用者可自行修改或清空目標
+    code, g_res = J(srv, "/api/team/rooms/goal", {"id": rid, "goal": "我自己寫的新目標"})
+    assert code == 200 and g_res["ok"] is True and g_res["room"]["goal"] == "我自己寫的新目標"
+
+    # 2. 跟隨 CE 計畫同步階段里程碑與 Wiki
+    code, s_res = J(srv, "/api/team/rooms/sync_plan", {"id": rid, "apply_goal": False})
+    assert code == 200 and s_res["ok"] is True
+    assert len(s_res["room"]["criteria"]) == 2
+    assert s_res["room"]["criteria"][0]["id"] == "U1"
+
+    # 3. 恢復至介入前狀態
+    code, rst_res = J(srv, "/api/team/rooms/reset", {"id": rid})
+    assert code == 200 and rst_res["ok"] is True
+    assert rst_res["room"]["goal"] == "" and rst_res["room"]["criteria"] == []
+
+    # 4. 封存舊房間並開啟新房間接續開發（過去紀錄存入 LLM Wiki）
+    J(srv, "/api/team/rooms/goal", {"id": rid, "goal": "第一階段開發"})
+    code, ho_res = J(srv, "/api/team/rooms/handoff", {"id": rid, "goal": "第二階段接續開發"})
+    assert code == 200 and ho_res["ok"] is True
+    new_room = ho_res["room"]
+    assert new_room["id"] != rid
+    assert new_room["goal"] == "第二階段接續開發"
+    assert new_room["source"] == f"handoff:{rid}"
+    assert len(new_room["criteria"]) == 2
+
+    state = J(srv, "/api/team/state")[1]
+    assert any(ar["id"] == rid for ar in state.get("archived_rooms", []))
+    wiki = J(srv, f"/api/team/wiki?room={new_room['id']}")[1]["wiki"]
+    assert len(wiki["pages"]) >= 1
+
+
+def test_room_progress_md_and_multiple_target_folders(srv, tmp_path):
+    from team.checks import snapshot_reference_root, verify_reference_untouched
+
+    srv.team.max_running_fn = lambda: 0
+    parent_a = tmp_path / "fullstack_A"
+    fe = parent_a / "frontend"
+    be = parent_a / "backend"
+    ref_doc = parent_a / "legacy_ref"
+    fe.mkdir(parents=True)
+    be.mkdir(parents=True)
+    ref_doc.mkdir(parents=True)
+    (fe / "index.ts").write_text("export const v = 1;\n", encoding="utf-8")
+    (be / "api.py").write_text("v = 1\n", encoding="utf-8")
+    (ref_doc / "spec.md").write_text("readonly legacy spec\n", encoding="utf-8")
+
+    # 1. 建立同時指定複數個目標資料夾 B（frontend + backend）的房間
+    code, res = J(
+        srv,
+        "/api/team/rooms",
+        {
+            "repo": str(parent_a),
+            "target_subdirs": ["frontend", "backend"],
+            "goal": "同時開發前後端兩個目標資料夾並保護 legacy_ref 唯讀",
+            "source": "goal",
+        },
+    )
+    assert code == 200 and res["ok"] is True, res
+    room = res["room"]
+    rid = room["id"]
+    assert room["target_subdirs"] == ["frontend", "backend"]
+    assert room["target_subdir"] == "frontend, backend"
+    assert os.path.normcase(room["reference_root"]) == os.path.normcase(str(parent_a))
+    assert "frontend/" in room["allowed_paths"] and "backend/" in room["allowed_paths"]
+
+    # 2. 驗證唯讀快照：修改 frontend 與 backend 皆合法，修改 legacy_ref 則會被攔截
+    snap = snapshot_reference_root(
+        room["reference_root"],
+        room["repo"],
+        exclude_subdir=room["target_subdir"],
+        exclude_subdirs=room["target_subdirs"],
+    )
+    (fe / "index.ts").write_text("export const v = 2;\n", encoding="utf-8")
+    (be / "api.py").write_text("v = 2\n", encoding="utf-8")
+    assert (
+        verify_reference_untouched(
+            snap,
+            room["reference_root"],
+            room["repo"],
+            exclude_subdir=room["target_subdir"],
+            exclude_subdirs=room["target_subdirs"],
+        )
+        == []
+    )
+    (ref_doc / "spec.md").write_text("tampered!\n", encoding="utf-8")
+    violated = verify_reference_untouched(
+        snap,
+        room["reference_root"],
+        room["repo"],
+        exclude_subdir=room["target_subdir"],
+        exclude_subdirs=room["target_subdirs"],
+    )
+    assert any("legacy_ref" in v for v in violated)
+
+    # 3. 驗證每個房間自動產生並維護 progress.md 斷點紀錄
+    code, detail = J(srv, f"/api/team/room?id={rid}")
+    assert code == 200
+    prog = detail["progress"]
+    assert "同時開發前後端兩個目標資料夾" in prog["markdown"]
+    assert "frontend/" in prog["markdown"] and "backend/" in prog["markdown"]
+    assert os.path.isfile(prog["store_path"])
+
+    code, sync_prog = J(srv, "/api/team/rooms/progress", {"id": rid, "note": "已完成前後端 API 對接"})
+    assert code == 200 and sync_prog["ok"] is True
+    assert "已完成前後端 API 對接" in sync_prog["progress"]["markdown"]
+
+    # 4. 驗證代管拒絕權限時，會把目標路徑送審，且拒絕意見與防鬼打牆指引會反映給 Developer 與 progress.md
+    from team.events import PermissionRequest, command_text
+
+    runner = srv.team._make_runner(srv.team.store.get(rid))
+    runner.set_delegate(True)
+    req = PermissionRequest(
+        tool_call_id="tc-write-1",
+        title="Write File",
+        kind="write",
+        raw_input={"path": "frontend/src/App.tsx", "content": "export default function App() {}"},
+        options=[
+            {"optionId": "allow_1", "name": "Allow once", "kind": "allow_once"},
+            {"optionId": "reject_1", "name": "Reject once", "kind": "reject_once"},
+        ],
+    )
+    assert "frontend/src/App.tsx" in command_text(req)
+    runner._notify_permission_rejected(
+        req,
+        command_text(req),
+        "審查模型不允許：請先確認元件匯出介面與測試覆蓋",
+        by="delegate",
+        read_only=False,
+    )
+    runner._notify_permission_rejected(
+        req,
+        command_text(req),
+        "審查模型不允許：連續第二次嘗試相同寫入",
+        by="delegate",
+        read_only=False,
+    )
+    comm_feedback = runner._take_role_comms()
+    assert "【跨角色協作溝通：AI 代管主管 (Decision-1 / GLM-5.3) → 實作工程師】" in comm_feedback
+    assert "審查模型不允許：請先確認元件匯出介面與測試覆蓋" in comm_feedback
+    assert "frontend/src/App.tsx" in comm_feedback
+    assert "【防鬼打牆破局提示】" in comm_feedback
+    prog_md = runner._build_progress_markdown()
+    assert "跨角色協作溝通紀錄" in prog_md
+    assert "AI 代管主管" in prog_md
+
+
+
+
+
 
 

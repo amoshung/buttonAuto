@@ -516,6 +516,24 @@ def test_office_detect_error_surfaces_in_view(tmp_path):
     o.stop()
 
 
+def test_office_detect_claude_and_all_clis(tmp_path):
+    from team.clis import CliInfo
+    o = _office(tmp_path, {
+        "kiro": CliInfo("kiro", "Kiro", "/x/kiro-cli", "acp"),
+        "claude": CliInfo("claude", "Claude Code", "/x/claude", "claude-headless"),
+    }, model_detector=lambda s: o._detect_seat("claude") if s == "claude" else {"models": KIRO_MODELS, "current": "auto"})
+    assert o.detect_models(["claude"]) == ["claude"]
+    assert wait_for(lambda: bool(o.models_view()["seats"]["claude"]["detected_at"]))
+    c_view = o.models_view()["seats"]["claude"]
+    c_ids = [m["id"] for m in c_view["models"]]
+    assert "haiku" in c_ids and "sonnet" in c_ids and "claude-sonnet-4-5" in c_ids
+    assert o.prefs.problem("claude", "claude-sonnet-4-5") == ""
+    started = o.detect_models(["all"])
+    assert "kiro" in started and "claude" in started
+    assert wait_for(lambda: not o.models_view()["seats"]["kiro"]["detecting"])
+    o.stop()
+
+
 def test_no_global_for_review_role(tmp_path, repo):  # noqa: F811
     prefs = _prefs(tmp_path)
     prefs._seats["agy"] = "gpt-9"  # 設定頁殘留的壞選擇（未偵測的 agy）

@@ -247,3 +247,119 @@ def test_fetch_goes_to_router():
 def test_fetch_on_review_seat_goes_to_router_not_reject():
     d = _kind("fetch", {"url": "https://example.com"}, ScriptedRouter(), read_only=True)
     assert d.outcome == "allow" and d.verdict is not None
+
+
+def test_tmp_commit_msg_allowed_while_reference_root_write_still_rejected():
+    scope = "/home/bofmgr/rust_bof456_server/.ai-team-worktrees/wt1"
+    ref_root = "/home/bofmgr"
+    # 寫入 /tmp/c1msg 作為 git commit -F 訊息不應被誤判為修改唯讀參考區
+    r_tmp = req("execute", "printf 'fix(audit): msg' > /tmp/c1msg && git commit -F /tmp/c1msg")
+    d_tmp = decide(r_tmp, goal="g", scope=scope, deny_patterns=DENY,
+                   router=ScriptedRouter(), read_only=False, reference_root=ref_root)
+    assert d_tmp.outcome == "allow"
+
+    # 真正試圖寫入唯讀參考區或透過 /tmp/.. 跳脫仍必須嚴格拒絕
+    r_ref = req("execute", "echo x > /home/bofmgr/cpp_bof456_server/a.cpp")
+    d_ref = decide(r_ref, goal="g", scope=scope, deny_patterns=DENY,
+                   router=ScriptedRouter(), read_only=False, reference_root=ref_root)
+    assert d_ref.outcome == "reject" and d_ref.rule == "scope"
+
+    r_trav = req("execute", "echo x > /tmp/../home/bofmgr/cpp_bof456_server/a.cpp")
+    d_trav = decide(r_trav, goal="g", scope=scope, deny_patterns=DENY,
+                    router=ScriptedRouter(), read_only=False, reference_root=ref_root)
+    assert d_trav.outcome == "reject" and d_trav.rule == "scope"
+
+
+def test_plan_context_passed_to_decision_model():
+    from team.policy import format_plan_context
+
+    seen = []
+
+    class SpyRouter(ScriptedRouter):
+        def decide_allow(self, state_text):
+            seen.append(state_text)
+            return AllowVerdict(True, 0.96, 0.02, "Decision-1", "計畫內安全操作")
+
+    plan_ctx = format_plan_context(
+        [{"id": "C1", "text": "修改 tools/cpp_rust_audit/cli.py 並新增測試", "check": "pytest tools/cpp_rust_audit"}],
+        ["高層主管核准使用 worktree 相對路徑"],
+        phase="build",
+        reference_root="/home/bofmgr",
+    )
+    r = PermissionRequest("t1", "edit", "Write File", {"path": "tools/cpp_rust_audit/cli.py"}, OPTS)
+    d = decide(
+        r,
+        goal="CPP 遷移 RUST",
+        scope="/home/bofmgr/rust_bof456_server/.ai-team-worktrees/wt1",
+        deny_patterns=DENY,
+        router=SpyRouter(),
+        read_only=False,
+        reference_root="/home/bofmgr",
+        plan_context=plan_ctx,
+    )
+    assert d.outcome == "allow"
+    assert seen and "C1: 修改 tools/cpp_rust_audit/cli.py" in seen[0]
+    assert "高層主管核准使用 worktree 相對路徑" in seen[0]
+    assert "唯讀參考母區" in seen[0]
+    assert "/home/bofmgr/rust_bof456_server/.ai-team-worktrees/wt1/tools/cpp_rust_audit/cli.py" in seen[0]
+
+
+def test_deterministic_gate_verdicts():
+    from team.policy import deterministic_gate
+    assert deterministic_gate(tests_passed=True) == "PASS"
+    assert deterministic_gate(tests_passed=False) == "REWORK"
+    assert deterministic_gate(tests_passed=True, security_critical=True) == "BLOCK"
+    assert deterministic_gate(tests_passed=True, review_version="abc", head_commit="def") == "REWORK"
+    assert deterministic_gate(tests_passed=True, blocking=["missing test"]) == "REWORK"
+    assert deterministic_gate(tests_passed=True, retries=4, max_retries=3) == "ESCALATE"
+
+
+def test_redirect_re_ignores_quoted_arrows_but_blocks_real_redirect():
+    scope = "/home/bofmgr/rust_bof456_server/.ai-team-worktrees/wt1"
+    ref = "/home/bofmgr"
+    # 字串內的 -> /home/bofmgr/... 不應被誤判成寫入重導向
+    r_grep = PermissionRequest(
+        "t1", "Run Command", "execute",
+        {"command": 'grep "-> /home/bofmgr/cpp_bof456_server/a.cpp" src/main.rs'},
+        OPTS,
+    )
+    d_grep = decide(r_grep, goal="g", scope=scope, deny_patterns=DENY, router=ScriptedRouter(), read_only=False, reference_root=ref)
+    assert d_grep.outcome == "allow"
+
+    # 真正的外部寫入重導向仍必須硬拒
+    r_bad = PermissionRequest(
+        "t2", "Run Command", "execute",
+        {"command": "echo hacked > '/home/bofmgr/cpp_bof456_server/a.cpp'"},
+        OPTS,
+    )
+    d_bad = decide(r_bad, goal="g", scope=scope, deny_patterns=DENY, router=ScriptedRouter(), read_only=False, reference_root=ref)
+    assert d_bad.outcome == "reject" and d_bad.rule == "scope"
+
+
+def test_readonly_execute_with_reference_root_path_reaches_router():
+    scope = "/home/bofmgr/rust_bof456_server/.ai-team-worktrees/wt1"
+    ref = "/home/bofmgr"
+    r = PermissionRequest(
+        "t3", "Run Command", "execute",
+        {"command": "cat /home/bofmgr/cpp_bof456_server/main.cpp", "path": "/home/bofmgr/cpp_bof456_server/main.cpp"},
+        OPTS,
+    )
+    d = decide(r, goal="g", scope=scope, deny_patterns=DENY, router=ScriptedRouter(), read_only=False, reference_root=ref)
+    assert d.outcome == "allow"
+
+
+def test_posix_scope_tilde_is_outside_and_relative_is_inside():
+    from team.policy import _outside_scope
+    scope = "/home/bofmgr/rust_bof456_server/.ai-team-worktrees/wt1"
+    assert _outside_scope("tools/cli.py", scope, base_dir=scope) is False
+    assert _outside_scope("~/cpp_bof456_server/a.cpp", scope, base_dir=scope) is True
+
+
+def test_folder_boundary_note_in_po_and_reviewer_prompts():
+    from team import personas
+    ref = "/home/bofmgr"
+    tgt = "rust_bof456_server"
+    assert "資料夾權限邊界" in personas.kickoff("g", "ctx", "slug", reference_root=ref, target_subdir=tgt)
+    assert "資料夾權限邊界" in personas.revise_spec(["x"], goal="g", reference_root=ref, target_subdir=tgt)
+    assert "資料夾權限邊界" in personas.review("g", [], "", "", reference_root=ref, target_subdir=tgt)
+    assert "資料夾權限邊界" in personas.checkpoint_review("g", [], "", "", "", "alert", reference_root=ref, target_subdir=tgt)

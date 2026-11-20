@@ -24,7 +24,7 @@ class PermissionRequest:
 
 
 def command_text(req: PermissionRequest) -> str:
-    """從 raw_input 取出指令文字；沒有則用 title。"""
+    """從 raw_input 取出指令文字；若無指令欄位但有目標檔案路徑，則附帶路徑資訊以免只剩空泛標題。"""
     raw = req.raw_input or {}
     for key in ("command", "cmd", "commandLine", "args"):
         val = raw.get(key)
@@ -32,6 +32,9 @@ def command_text(req: PermissionRequest) -> str:
             val = " ".join(str(x) for x in val)
         if isinstance(val, str) and val.strip():
             return val
+    paths = _paths_of(raw, raw)
+    if paths:
+        return "%s (%s)" % (req.title or req.kind or "file_op", ", ".join(paths[:4]))
     return req.title
 
 
@@ -46,8 +49,8 @@ MASK_MAX = 400000  # 一次遮蔽的最長輸入（事件細節最後只留幾�
 _KEYISH = _re.compile(r"(?i)(\b(?:api[_-]?key|(?:[a-z0-9]{1,20}[_-]){0,3}token|secret[a-z_]{0,30}|password|passwd|"
                       r"authorization|bearer|x-api-key|private[_-]?key)\b"
                       r"[\"']?\s{0,5}[:=]?\s{0,5}[\"']?(?:bearer\s{1,5})?)([A-Za-z0-9._\-/+=]{8,})")
-# 有固定前綴的金鑰（GitHub、OpenAI 風格）：不論前後文都遮
-_PREFIXED = _re.compile(r"\b(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|sk-)[A-Za-z0-9_\-]{8,}")
+# 有固定前綴的金鑰（GitHub、OpenAI、中鋼主權 AI 風格）：不論前後文都遮
+_PREFIXED = _re.compile(r"\b(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|sk-|moa_)[A-Za-z0-9_\-]{8,}")
 
 
 def clip(text: Any, n: int = DETAIL_MAX, tail: bool = False) -> str:
@@ -104,7 +107,8 @@ def _paths_of(data: Dict[str, Any], raw: Dict[str, Any]) -> List[str]:
         for p in (v if isinstance(v, (list, tuple)) else [v]):
             if isinstance(p, str) and p.strip() and p not in out:
                 out.append(clip(p.strip(), PATH_MAX, tail=True))
-    for loc in data.get("locations") or []:  # ACP：locations [{path, line}]
+    locs = data.get("locations")
+    for loc in locs if isinstance(locs, (list, tuple)) else []:  # ACP：locations [{path, line}]
         p = loc.get("path") if isinstance(loc, dict) else None
         if isinstance(p, str) and p.strip() and p not in out:
             out.append(clip(p.strip(), PATH_MAX, tail=True))

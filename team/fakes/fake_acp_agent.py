@@ -112,6 +112,18 @@ class Agent:
                 return str(step["error"])
             if "say" in step:
                 self.say(step["say"])
+            elif "say_report" in step:
+                rep = dict(step["say_report"])
+                sha = self.run_git("rev-parse", "--short", "HEAD").stdout.strip() or "HEAD"
+                crit = []
+                for c in rep.get("criteria") or []:
+                    c = dict(c)
+                    if c.get("commit") in (None, "", "HEAD"):
+                        c["commit"] = sha
+                    crit.append(c)
+                if crit:
+                    rep["criteria"] = crit
+                self.say("DONE\n```json\n%s\n```" % json.dumps(rep, ensure_ascii=False))
             elif "usage" in step:
                 u = step["usage"]
                 upd = {"sessionUpdate": "usage_update", "used": u.get("used", 0), "size": u.get("size", 0)}

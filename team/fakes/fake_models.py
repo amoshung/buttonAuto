@@ -58,6 +58,13 @@ class ScriptedRouter(ModelRouter):
         purpose = (ctx or {}).get("purpose") or "產生文字"
         if ctx and ctx.get("note"):
             text = "（示範假模型）%s：請對準目標「%s」，每條條件都用指令驗證。" % (purpose, goal)
+        elif purpose == "L2 診斷問題根因" and any(k in (prompt or "") for k in ("FileNotFoundError", "reference", "外部資料", "git 外")):
+            text = (
+                '```json\n'
+                '{"category":"env","evidence":["FileNotFoundError: 測試需要 git 外資料（如 reference/）"],'
+                '"action":"測試依賴 git 以外的環境資料，建議標記為環境既有失敗或提供資料","unsure":[]}\n'
+                '```'
+            )
         else:
             text = "（假模型回覆）請繼續朝目標前進：" + goal
         self._fake("glm", "normal" if effort == "normal" else "low", ctx, purpose, "產生 %d 字" % len(text),

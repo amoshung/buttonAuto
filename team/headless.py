@@ -24,6 +24,7 @@ import re
 import shlex
 import subprocess
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from team.acp import AcpError, _kill_tree, _secs
@@ -147,13 +148,18 @@ class HeadlessClaude:
         else:
             kw["start_new_session"] = True  # 讓取消時能整個程序群組一起結束
         self._turn = None  # 先清掉：程序起不來時不要沿用上一回合的用量
+        spawn_cwd = (
+            None
+            if (len(self.base_cmd) > 3 and self.base_cmd[1:3] == ["-u", "-c"] and "REMOTE_STUB" in self.base_cmd[3] and not os.path.isdir(self.cwd))
+            else self.cwd
+        )
         with self._lock:
             self._cancelled = False
             self._timed_out = False
             try:
                 proc = subprocess.Popen(
                     self.build_cmd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, cwd=self.cwd, env=env,
+                    stderr=subprocess.PIPE, cwd=spawn_cwd, env=env,
                     text=True, encoding="utf-8", errors="replace", bufsize=1, **kw)
             except OSError as e:
                 raise AcpError("無法啟動 claude：%s" % e)
@@ -167,8 +173,20 @@ class HeadlessClaude:
         err_thread = threading.Thread(target=self._read_stderr, args=(proc, stderr),
                                       name="claude-stderr", daemon=True)
         err_thread.start()
-        timer = threading.Timer(timeout, self._on_timeout, args=(proc,))
-        timer.daemon = True
+        stop_watch = threading.Event()
+        started = time.monotonic()
+        last_activity = [started]
+        idle_limit = float(timeout)
+        max_total = max(idle_limit * 4.0, 1800.0)
+
+        def _watchdog() -> None:
+            while not stop_watch.wait(min(2.0, max(0.05, idle_limit / 4.0))):
+                now = time.monotonic()
+                if (now - last_activity[0]) >= idle_limit or (now - started) >= max_total:
+                    self._on_timeout(proc)
+                    break
+
+        timer = threading.Thread(target=_watchdog, name="claude-watchdog", daemon=True)
         timer.start()
         state = {"result": None, "used": None, "size": None}  # type: Dict[str, Any]
         try:
@@ -176,6 +194,7 @@ class HeadlessClaude:
                 line = line.strip()
                 if not line:
                     continue
+                last_activity[0] = time.monotonic()
                 try:
                     msg = json.loads(line)
                 except ValueError:
@@ -187,12 +206,12 @@ class HeadlessClaude:
                     except Exception:
                         log.exception("處理 claude 輸出失敗")
                 if state["result"] is not None:
-                    timer.cancel()  # 已拿到結果：不再逾時
+                    stop_watch.set()  # 已拿到結果：不再逾時
                     break
         except Exception:
             log.debug("讀取 claude 輸出中斷", exc_info=True)
         finally:
-            timer.cancel()
+            stop_watch.set()
         try:
             code = proc.wait(5)
         except subprocess.TimeoutExpired:

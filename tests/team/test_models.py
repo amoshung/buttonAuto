@@ -125,7 +125,7 @@ def test_write_normal_timeout_falls_back_to_low():
         return "low result"
     r = ModelRouter(_cfg(), glm=glm)
     assert r.write("寫點東西", effort="normal") == "low result"
-    assert calls == [("normal", 150), ("low", 30)]
+    assert calls == [("normal", 240), ("low", 60)]
     u = r.usage()
     assert u["glm_timeout"] == 1 and u["glm_calls"] == 2
 
@@ -208,3 +208,41 @@ def test_questions_import_error_escalates(monkeypatch):
     monkeypatch.setattr(tm, "approval_questions", boom)
     v = ModelRouter(_cfg(), d1=_d1(0.95, 0.05), glm=_glm(0.95, 0.05)).decide_allow("x")
     assert v.auto is False and v.by == "none"
+
+
+def test_load_model_config_sovereign_ai_and_masking(tmp_path):
+    from team.events import mask_text
+
+    p = tmp_path / "litellm.local.json"
+    p.write_text(json.dumps({
+        "base_url": "http://litellm.local:4000",
+        "key": GLM_KEY,
+        "decision1_key": D1_KEY,
+        "sovereign_base_url": "http://172.16.249.171:31305",
+        "sovereign_key": "moa_test_secret_token_999",
+    }), encoding="utf-8")
+    cfg = load_model_config(str(p))
+    assert cfg is not None
+    assert cfg.sovereign_base_url == "http://172.16.249.171:31305"
+    assert cfg.sovereign_key == "moa_test_secret_token_999"
+    assert cfg.embedding_model == "qwen3-embedding"
+    assert cfg.embedding_dim == 2560
+    assert cfg.rerank_model == "bge-reranker-v2-m3"
+    assert "moa_test_secret_token_999" not in repr(cfg)
+    assert "moa_test_secret_token_999" not in str(cfg)
+    assert GLM_KEY not in repr(cfg)
+    assert mask_text("Bearer moa_abc1234567890") == "Bearer moa_***"
+
+
+def test_load_model_config_missing_sovereign_and_forbidden_models(tmp_path):
+    p = tmp_path / "litellm.local.json"
+    p.write_text(json.dumps({
+        "base_url": "http://litellm.local:4000",
+        "key": GLM_KEY,
+        "decision1_key": D1_KEY,
+        "glm_model": "gemma-4-31b",
+    }), encoding="utf-8")
+    cfg = load_model_config(str(p))
+    assert cfg is not None
+    assert cfg.sovereign_key == ""
+    assert cfg.glm_model == "glm-5.3"

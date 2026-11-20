@@ -164,6 +164,8 @@ class AppConfig:
     open_browser: bool = True
     # 多 CLI 辦公室：同時「運作中」的房間上限（其餘排隊）
     team_max_running: float = 4.0
+    # 成本護欄：每日 Token 上限（0 表示不限制；超過上限自動暫停全部房間）
+    team_daily_token_limit: int = 0
     # Claude／GLM 座位載入的外掛資料夾或 .zip（以分號分隔；找不到就略過）
     team_plugin_dirs: str = ""
     # Decision-1 派工：分數 = 適合度 − 成本權重 × 相對成本

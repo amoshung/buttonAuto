@@ -26,15 +26,26 @@ import requests
 
 from ai_client import DecisionClient, build_llm_decision_prompt, parse_llm_decision
 from team.events import DETAIL_MAX, clip, mask_detail
+from team.schemas import SecondOpinion, response_format_for, validate_schema
 from team.usage import ModelCall, now_iso
 
 log = logging.getLogger(__name__)
 
 D1_TIMEOUT = 10.0
-GLM_TIMEOUTS = {"low": 30.0, "normal": 150.0}
+GLM_TIMEOUTS = {"low": 60.0, "medium": 180.0, "high": 240.0, "normal": 240.0}
 D1_CONCURRENCY = 8
-GLM_CONCURRENCY = {"low": 4, "normal": 1}
+GLM_CONCURRENCY = {"low": 4, "medium": 2, "high": 1, "normal": 2}
 GLM_MAX_TOKENS = 8000
+
+
+def _normalize_glm_effort(effort: str) -> str:
+    """將思考量正規化為 glm-5.3 支援的 low / medium / high（舊值 normal 映射為 medium）。"""
+    e = str(effort or "low").strip().lower()
+    if e in ("normal", "medium"):
+        return "medium"
+    if e == "high":
+        return "high"
+    return "low"
 
 def parse_opinion(text: Any) -> Tuple[Optional[bool], str]:
     """審查模型第二意見：從回覆中找最後一個含 ok 的 JSON 物件；找不到 → (None, 原因)。"""
@@ -64,6 +75,9 @@ def _mask(v: str) -> str:
     return "***" if v else "''"
 
 
+_FORBIDDEN_MODELS = ("gemma", "muse-glimmer")
+
+
 @dataclass
 class ModelConfig:
     base_url: str
@@ -71,16 +85,35 @@ class ModelConfig:
     decision1_key: str
     glm_model: str = "glm-5.3"
     d1_model: str = "Decision-1"
+    sovereign_base_url: str = ""
+    sovereign_key: str = ""
+    embedding_model: str = "qwen3-embedding"
+    embedding_dim: int = 2560
+    rerank_model: str = "bge-reranker-v2-m3"
 
     def __repr__(self) -> str:
-        return "ModelConfig(base_url=%r, glm_key=%s, decision1_key=%s, glm_model=%r, d1_model=%r)" % (
-            self.base_url, _mask(self.glm_key), _mask(self.decision1_key), self.glm_model, self.d1_model)
+        return (
+            "ModelConfig(base_url=%r, glm_key=%s, decision1_key=%s, glm_model=%r, d1_model=%r, "
+            "sovereign_base_url=%r, sovereign_key=%s, embedding_model=%r, embedding_dim=%r, rerank_model=%r)"
+            % (
+                self.base_url,
+                _mask(self.glm_key),
+                _mask(self.decision1_key),
+                self.glm_model,
+                self.d1_model,
+                self.sovereign_base_url,
+                _mask(self.sovereign_key),
+                self.embedding_model,
+                self.embedding_dim,
+                self.rerank_model,
+            )
+        )
 
     __str__ = __repr__
 
 
 def load_model_config(path: str) -> Optional[ModelConfig]:
-    """讀 litellm.local.json：base_url、key（glm）、decision1_key；可選 glm_model、d1_model。
+    """讀 litellm.local.json：base_url、key（glm）、decision1_key；可選 glm_model、d1_model 與中鋼主權 AI 向量設定。
 
     檔案不存在、格式錯誤或缺欄位 → None（不記錄任何值）。
     """
@@ -93,15 +126,30 @@ def load_model_config(path: str) -> Optional[ModelConfig]:
         return None
     base_url = d.get("base_url")
     glm_key = d.get("key") or d.get("glm_key")
-    d1_key = d.get("decision1_key")
+    # 允許單一金鑰端點（例如自架 LiteLLM / Ollama / OpenAI 相容端點）：省略 decision1_key 時自動沿用 glm_key
+    d1_key = d.get("decision1_key") or glm_key
     if not all(isinstance(v, str) and v.strip() for v in (base_url, glm_key, d1_key)):
-        log.warning("模型設定缺少欄位（需要 base_url、key、decision1_key）：%s", path)
+        log.warning("模型設定缺少欄位（需要 base_url 與 key）：%s", path)
         return None
     cfg = ModelConfig(base_url=base_url.strip(), glm_key=glm_key.strip(), decision1_key=d1_key.strip())
     if isinstance(d.get("glm_model"), str) and d["glm_model"].strip():
-        cfg.glm_model = d["glm_model"].strip()
+        cand = d["glm_model"].strip()
+        if any(bad in cand.lower() for bad in _FORBIDDEN_MODELS):
+            log.warning("設定嘗試使用停用模型 %s，已強制退回 glm-5.3", cand)
+        else:
+            cfg.glm_model = cand
     if isinstance(d.get("d1_model"), str) and d["d1_model"].strip():
         cfg.d1_model = d["d1_model"].strip()
+    if isinstance(d.get("sovereign_base_url"), str) and d["sovereign_base_url"].strip():
+        cfg.sovereign_base_url = d["sovereign_base_url"].strip().rstrip("/")
+    if isinstance(d.get("sovereign_key"), str) and d["sovereign_key"].strip():
+        cfg.sovereign_key = d["sovereign_key"].strip()
+    if isinstance(d.get("embedding_model"), str) and d["embedding_model"].strip():
+        cfg.embedding_model = d["embedding_model"].strip()
+    if isinstance(d.get("embedding_dim"), int) and d["embedding_dim"] > 0:
+        cfg.embedding_dim = d["embedding_dim"]
+    if isinstance(d.get("rerank_model"), str) and d["rerank_model"].strip():
+        cfg.rerank_model = d["rerank_model"].strip()
     return cfg
 
 
@@ -241,7 +289,11 @@ class _Track:
             d["threshold"] = lim
         d["verdict"] = self.result if self.ok else "失敗：" + (self.result or "")
         cfg = self.router.cfg
-        secrets = (getattr(cfg, "glm_key", ""), getattr(cfg, "decision1_key", "")) if cfg is not None else ()
+        secrets = (
+            getattr(cfg, "glm_key", ""),
+            getattr(cfg, "decision1_key", ""),
+            getattr(cfg, "sovereign_key", ""),
+        ) if cfg is not None else ()
         # 先遮蔽再截斷（先截可能把金鑰切成兩半而遮不到）
         d = mask_detail({k: v for k, v in d.items() if v not in (None, "", {}, [])}, secrets)
         for k, v in list(d.items()):
@@ -358,28 +410,32 @@ class ModelRouter:
         answers, meta = client.systemone_meta(state, questions)
         return ModelReply(answers, meta.get("usage"), meta.get("model") or "")
 
-    def _http_glm(self, prompt: str, effort: str, timeout: float) -> ModelReply:
+    def _http_glm(self, prompt: str, effort: str, timeout: float,
+                  response_format: Optional[Dict[str, Any]] = None,
+                  model_override: str = "") -> ModelReply:
         if self.cfg is None:
             raise ModelError("缺少 litellm.local.json，glm 不可用")
-        payload: Dict[str, Any] = {"model": self.cfg.glm_model, "max_tokens": GLM_MAX_TOKENS,
+        target_model = (model_override or "").strip() or self.cfg.glm_model
+        payload: Dict[str, Any] = {"model": target_model, "max_tokens": GLM_MAX_TOKENS,
+                                   "reasoning_effort": _normalize_glm_effort(effort),
                                    "messages": [{"role": "user", "content": prompt}]}
-        if effort == "low":
-            payload["reasoning_effort"] = "low"
+        if response_format is not None:
+            payload["response_format"] = response_format
         try:
             r = requests.post(self.cfg.base_url.rstrip("/") + "/v1/chat/completions",
                               headers={"Authorization": "Bearer " + self.cfg.glm_key},
                               json=payload, timeout=timeout)
         except requests.Timeout as e:
-            raise TimeoutError("%s 逾時（%s 秒）" % (self.cfg.glm_model, timeout)) from e
+            raise TimeoutError("%s 逾時（%s 秒）" % (target_model, timeout)) from e
         except requests.RequestException as e:
-            raise ModelError("%s 連線失敗：%s" % (self.cfg.glm_model, type(e).__name__)) from e
+            raise ModelError("%s 連線失敗：%s" % (target_model, type(e).__name__)) from e
         if r.status_code != 200:
-            raise ModelError("%s 回應 %s" % (self.cfg.glm_model, r.status_code))
+            raise ModelError("%s 回應 %s" % (target_model, r.status_code))
         try:
             data = r.json()
             text = data["choices"][0]["message"]["content"] or ""
         except (ValueError, KeyError, IndexError, TypeError) as e:
-            raise ModelError("%s 回應格式錯誤" % self.cfg.glm_model) from e
+            raise ModelError("%s 回應格式錯誤" % target_model) from e
         usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
         model = data.get("model") if isinstance(data.get("model"), str) else ""
         return ModelReply(text, usage, model)
@@ -461,18 +517,42 @@ class ModelRouter:
                 t.ok, t.result = summarize(answers)
             return answers, t.model
 
+    def _invoke_glm(self, prompt: str, effort: str, timeout: float,
+                    response_format: Optional[Dict[str, Any]] = None,
+                    model_override: str = "") -> Any:
+        try:
+            sig = inspect.signature(self._glm)
+            params = list(sig.parameters.values())
+            accepts_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+            accepts_rf = ("response_format" in sig.parameters
+                          or len(params) >= 4
+                          or any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+                          or accepts_kw)
+            accepts_override = ("model_override" in sig.parameters or accepts_kw)
+        except (TypeError, ValueError):
+            accepts_rf = False
+            accepts_override = False
+        if model_override and accepts_override:
+            return self._glm(prompt, effort, timeout, response_format, model_override=model_override)
+        if response_format is not None and accepts_rf:
+            return self._glm(prompt, effort, timeout, response_format)
+        return self._glm(prompt, effort, timeout)
+
     def _call_glm(self, prompt: str, effort: str, ctx: Optional[Dict[str, Any]] = None, purpose: str = "",
                   summarize: Optional[Callable[[str], Tuple[bool, str]]] = None,
-                  detail: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+                  detail: Optional[Dict[str, Any]] = None,
+                  response_format: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
         """回傳（文字, 實際模型名）。detail：給時間軸看的題目／狀態摘要（沒給就記整段提示）。"""
-        effort = "normal" if effort == "normal" else "low"
+        effort = _normalize_glm_effort(effort)
+        model_override = str((ctx or {}).get("model_override") or "").strip()
+        effective_model = model_override or self.glm_name
         self._count("glm_calls")
-        with self._track("glm", self.glm_name, effort, ctx, purpose) as t:
+        with self._track("glm", effective_model, effort, ctx, purpose) as t:
             t.detail = dict(detail) if detail else {"question": prompt}
             try:
                 with self._glm_sem[effort]:
                     t.start()
-                    text = t.got(self._glm(prompt, effort, GLM_TIMEOUTS[effort]))
+                    text = t.got(self._invoke_glm(prompt, effort, GLM_TIMEOUTS[effort], response_format, model_override=model_override))
             except Exception as e:
                 self._count("glm_timeout" if _is_timeout(e) else "glm_fail")
                 raise
@@ -602,19 +682,71 @@ class ModelRouter:
             log.info("%s 不可用：%s", self.glm_name, type(e).__name__)
         return None
 
-    def write(self, prompt: str, effort: str = "low", ctx: Optional[Dict[str, Any]] = None) -> str:
+    def write(self, prompt: str, effort: str = "low", ctx: Optional[Dict[str, Any]] = None,
+              response_format: Optional[Dict[str, Any]] = None) -> str:
         purpose = (ctx or {}).get("purpose") or "產生文字"
-        if effort == "normal":
+        eff = _normalize_glm_effort(effort)
+        if eff in ("medium", "high"):
             try:
-                return self._call_glm(prompt, "normal", ctx, purpose)[0]
+                return self._call_glm(prompt, eff, ctx, purpose, response_format=response_format)[0]
             except Exception as e:
                 if not _is_timeout(e):
                     raise ModelError("%s 產生文字失敗：%s" % (self.glm_name, type(e).__name__)) from e
-                log.info("%s 一般思考量逾時，改用低思考量重試", self.glm_name)
+                log.info("%s %s 思考量逾時，改用低思考量重試", self.glm_name, eff)
         try:
-            return self._call_glm(prompt, "low", ctx, purpose)[0]
+            return self._call_glm(prompt, "low", ctx, purpose, response_format=response_format)[0]
         except Exception as e:
             raise ModelError("%s 產生文字失敗：%s" % (self.glm_name, type(e).__name__)) from e
+
+    def write_json(self, prompt: str, schema_cls: Any, effort: str = "low",
+                   ctx: Optional[Dict[str, Any]] = None,
+                   detail: Optional[Dict[str, Any]] = None,
+                   summarize: Optional[Callable[[str], Tuple[bool, str]]] = None) -> Any:
+        """強制以 JSON Schema 呼叫 glm-5.3，驗證失敗最多重問一次，仍失敗則 fail-closed 丟出 ModelError。"""
+        purpose = (ctx or {}).get("purpose") or ("結構化輸出：" + schema_cls.__name__)
+        eff = _normalize_glm_effort(effort)
+        rf_strict = response_format_for(schema_cls, strict=True)
+        schema_json = json.dumps(rf_strict["json_schema"]["schema"], ensure_ascii=False)
+
+        def _invoke(p: str, cur_eff: str, rf: Dict[str, Any]) -> str:
+            try:
+                return self._call_glm(p, cur_eff, ctx, purpose, summarize=summarize, detail=detail, response_format=rf)[0]
+            except Exception as e:
+                if cur_eff in ("medium", "high") and _is_timeout(e):
+                    log.info("%s %s 思考量逾時，改用低思考量重試", self.glm_name, cur_eff)
+                    return self._call_glm(p, "low", ctx, purpose, summarize=summarize, detail=detail, response_format=rf)[0]
+                raise
+
+        rf_active: Dict[str, Any] = rf_strict
+        active_prompt = prompt
+        try:
+            raw = _invoke(active_prompt, eff, rf_active)
+        except ModelError as e:
+            msg = str(e)
+            if "400" in msg or "422" in msg:
+                rf_active = {"type": "json_object"}
+                active_prompt = (
+                    f"{prompt}\n\n請只輸出符合以下 JSON Schema 的純 JSON 物件（不要 markdown 圍欄）：\n{schema_json}"
+                )
+                raw = _invoke(active_prompt, eff, rf_active)
+            else:
+                raise
+        except Exception as e:
+            raise ModelError("%s 結構化呼叫失敗：%s" % (self.glm_name, type(e).__name__)) from e
+
+        try:
+            return validate_schema(raw, schema_cls)
+        except Exception as first_err:
+            repair_prompt = (
+                f"{active_prompt}\n\n"
+                f"上一輪輸出的 JSON 驗證錯誤：{first_err}\n"
+                f"請嚴格依照以下 JSON Schema 修正並只輸出合法的 JSON 物件：\n{schema_json}"
+            )
+            try:
+                repaired = _invoke(repair_prompt, "low", rf_active)
+                return validate_schema(repaired, schema_cls)
+            except Exception as second_err:
+                raise ModelError("%s 結構化輸出驗證失敗：%s" % (self.glm_name, type(second_err).__name__)) from second_err
 
     # ---- Task 20：代管 ----
     def second_opinion(self, question: str, material: str, ctx: Optional[Dict[str, Any]] = None) -> Tuple[Optional[bool], str]:
@@ -627,22 +759,22 @@ class ModelRouter:
                   % (f.notice, question, f.wrap("資料", material), OPINION_FORMAT))
         detail = {"question": question, "state_excerpt": material}
 
-        def summ(text: str) -> Tuple[bool, str]:
-            ok, reason = parse_opinion(text)
-            if ok is None:
-                return False, reason
-            return True, ("通過：" if ok else "不通過：") + reason[:150]
-        for eff in ((effort, "low") if effort == "normal" else (effort,)):
+        def _summ_opinion(raw: str) -> Tuple[bool, str]:
             try:
-                text, _ = self._call_glm(prompt, eff, ctx, purpose, summ, detail)
-                return parse_opinion(text)
-            except Exception as e:
-                if eff == "normal" and _is_timeout(e):
-                    log.info("%s 一般思考量逾時，改用低思考量重試", self.glm_name)
-                    continue
-                log.info("審查模型不可用：%s", type(e).__name__)
-                return None, "審查模型不可用（%s）" % type(e).__name__
-        return None, "審查模型不可用"
+                v = validate_schema(raw, SecondOpinion)
+                return True, ("%s：%s" % ("通過" if v.ok else "不通過", v.reason))
+            except Exception:
+                return False, "回應不是有效 JSON"
+
+        try:
+            verdict = self.write_json(
+                prompt, SecondOpinion, effort=effort,
+                ctx={**(ctx or {}), "purpose": purpose}, detail=detail, summarize=_summ_opinion,
+            )
+            return verdict.ok, verdict.reason
+        except Exception as e:
+            log.info("審查模型不可用：%s", type(e).__name__)
+            return None, "審查模型不可用（%s）" % type(e).__name__
 
     def choose(self, state_text: str, question: str, options: List[Dict[str, str]],
                ctx: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], Dict[str, float]]:

@@ -17,6 +17,36 @@ MAX_PROJECTS = 30
 MAX_DIRTY = 20
 MAX_DOCS = 15
 EXCERPT_CHARS = 800
+_IGNORE_SUBDIRS = {
+    ".git",
+    ".ai-team-worktrees",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".next",
+    "dist",
+    "build",
+    ".pytest_cache",
+}
+
+
+def _subdirs(path: str) -> List[str]:
+    """回傳第一層非隱藏的子資料夾名稱（排序後），供派工精靈選擇工作目標 B。"""
+    if not path or not os.path.isdir(path):
+        return []
+    out: List[str] = []
+    try:
+        for entry in os.listdir(path):
+            if entry.startswith(".") or entry in _IGNORE_SUBDIRS:
+                continue
+            full = os.path.join(path, entry)
+            if os.path.isdir(full):
+                out.append(entry)
+    except OSError:
+        return []
+    out.sort(key=lambda s: s.lower())
+    return out
 
 _KEYWORDS = r"(?:目前|當前|進行中|current|next|下一步)"
 _HEADING = re.compile(r"^(#{1,6})\s*(.+?)\s*#*\s*$")
@@ -47,7 +77,7 @@ def known_projects(extra: Iterable[str] = (), appdata: Optional[str] = None) -> 
             return
         seen.add(key)
         name = os.path.basename(os.path.normpath(path)) or path
-        out.append({"name": name, "path": path, "source": source})
+        out.append({"name": name, "path": path, "repo": path, "source": source})
 
     for p in extra or ():
         if isinstance(p, str) and p.strip():
@@ -206,15 +236,46 @@ def _git_state(path: str) -> Dict[str, Any]:
     return {"branch": branch, "dirty": dirty}
 
 
+def _detect_checks(path: str) -> List[str]:
+    checks: List[str] = []
+    if (
+        os.path.isfile(os.path.join(path, "pytest.ini"))
+        or os.path.isfile(os.path.join(path, "pyproject.toml"))
+        or os.path.isdir(os.path.join(path, "tests"))
+    ):
+        checks.append("pytest")
+    pkg = os.path.join(path, "package.json")
+    if os.path.isfile(pkg):
+        try:
+            import json
+            with open(pkg, encoding="utf-8") as f:
+                pdata = json.load(f)
+            scripts = (pdata.get("scripts") or {}) if isinstance(pdata, dict) else {}
+            if "test" in scripts:
+                checks.append("npm test")
+            if "lint" in scripts:
+                checks.append("npm run lint")
+        except Exception:
+            pass
+    if os.path.isfile(os.path.join(path, "Cargo.toml")):
+        checks.append("cargo test")
+    if os.path.isfile(os.path.join(path, "go.mod")):
+        checks.append("go test ./...")
+    return checks
+
+
 def scan_project(path: str) -> Dict[str, Any]:
     path = (path or "").strip()
     full = os.path.abspath(path) if path else ""
     name = os.path.basename(os.path.normpath(full)) if full else ""
     out: Dict[str, Any] = {"path": full, "name": name, "problem": "", "branch": "", "dirty": [],
+                           "subdirs": [], "checks": [],
                            "progress": {"file": "", "task": "", "excerpt": ""}, "docs": []}
     if not full or not os.path.isdir(full):
         out["problem"] = "找不到資料夾：%s" % (path or "（空白）")
         return out
+    out["subdirs"] = _subdirs(full)
+    out["checks"] = _detect_checks(full)
     out["problem"] = gitops.repo_problem(full)
     try:
         is_repo = gitops.git(full, "rev-parse", "--is-inside-work-tree", timeout=10).strip() == "true"
