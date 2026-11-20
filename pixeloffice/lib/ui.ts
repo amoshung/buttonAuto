@@ -31,10 +31,9 @@ export const MODE_META: Record<SessionMode, { label: string; short: string; dot:
 };
 
 export const PHASES: { id: NonNullable<AgentWorker['phase']>; step: string; label: string; hint: string }[] = [
-  { id: 'goal', step: '①', label: '確認目標', hint: '助理推測或請代理說明最終目標' },
-  { id: 'spec', step: '②', label: '驗收 spec', hint: '和代理討論出可檢查的驗收條件' },
-  { id: 'build', step: '③', label: '實作與查核', hint: '代理實作、助理要證據並在本機查核' },
-  { id: 'done', step: '④', label: '已達成', hint: '所有自動化條件都有證據' },
+  { id: 'goal', step: '①', label: '目標與 CE 計畫', hint: '設定房間目標並跟隨 docs/plans/ (ce-plan) 里程碑' },
+  { id: 'build', step: '②', label: 'CE 實作與驗證', hint: '依 ce-work / ce-debug 實作並通過測試關卡' },
+  { id: 'done', step: '③', label: '已完成 (LLM Wiki 沉澱)', hint: '通過 ce-code-review 並將知識寫入 LLM Wiki' },
 ];
 
 export const modeOf = (w: AgentWorker): SessionMode => w.mode ?? 'off';
@@ -66,3 +65,34 @@ export function formatTime(iso: string) {
 export function progressPct(w: AgentWorker): number {
   return w.core ? Math.round((100 * (w.verified ?? 0)) / w.core) : 0;
 }
+
+export async function copyTextToClipboard(text: string): Promise<boolean> {
+  const payload = String(text ?? '').trim();
+  if (!payload) return false;
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(payload);
+      return true;
+    }
+  } catch {
+    // fallback below
+  }
+  try {
+    if (typeof document !== 'undefined') {
+      const ta = document.createElement('textarea');
+      ta.value = payload;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+

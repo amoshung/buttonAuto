@@ -76,6 +76,26 @@ def _default_never_click() -> List[str]:
     ]
 
 
+# 自主程度：同一組門檻一次調好。危險指令規則（deny_patterns）與「刪除／覆寫歷史一律交給你」在任何程度都不變。
+AUTONOMY_PRESETS: Dict[str, Dict[str, Any]] = {
+    "careful": {
+        "label": "保守", "desc": "風險稍高就交給你；適合剛開始觀察助理的判斷",
+        "values": {"ai_max_risk": 0.2, "ai_risk_review_max": 0.5, "ai_min_confidence": 0.7,
+                   "ai_choice_min_confidence": 0.6, "autopilot_max_per_hour": 8.0, "evidence_max_attempts": 3.0},
+    },
+    "balanced": {
+        "label": "平衡", "desc": "一般指令自動處理，灰色地帶找第二意見；預設值",
+        "values": {"ai_max_risk": 0.3, "ai_risk_review_max": 0.7, "ai_min_confidence": 0.6,
+                   "ai_choice_min_confidence": 0.5, "autopilot_max_per_hour": 12.0, "evidence_max_attempts": 3.0},
+    },
+    "bold": {
+        "label": "積極", "desc": "盡量不停下來問你，一路推進；只有危險規則與高風險才交給你",
+        "values": {"ai_max_risk": 0.45, "ai_risk_review_max": 0.85, "ai_min_confidence": 0.5,
+                   "ai_choice_min_confidence": 0.4, "autopilot_max_per_hour": 20.0, "evidence_max_attempts": 4.0},
+    },
+}
+
+
 @dataclass
 class AppConfig:
     # 共用：ai = AI 工程助理；image / uia = 退回基本按鈕精靈
@@ -132,6 +152,30 @@ class AppConfig:
     autopilot_max_per_hour: float = 12.0
     evidence_max_attempts: float = 3.0
     rollover_after_sends: float = 30.0
+    # 背景輸入：先用 UIA ValuePattern 把訊息放進聊天框、再用 UIA 按送出鈕，完全不碰鍵盤與焦點，
+    # 所以你正在打字也不用等。IDE 不接受時自動改用「等你停手 → 切到前景貼上」的舊方式。
+    ai_background_input: bool = True
+    # 目標綁定的對話不在畫面上時（你在 IDE 切到別的對話），自動駕駛改綁目前顯示的對話繼續推進，而不是停下來等
+    follow_visible_chat: bool = False
+    # 自主程度：careful／balanced／bold，一次調整風險門檻、信心度與每小時上限（之後仍可個別微調）
+    autonomy_level: str = "balanced"
+    # 網頁主控台（server.py）：固定連接埠，被占用時往後找空的；啟動後自動在預設瀏覽器打開
+    web_port: float = 8765.0
+    open_browser: bool = True
+    # 多 CLI 辦公室：同時「運作中」的房間上限（其餘排隊）
+    team_max_running: float = 4.0
+    # 成本護欄：每日 Token 上限（0 表示不限制；超過上限自動暫停全部房間）
+    team_daily_token_limit: int = 0
+    # Claude／GLM 座位載入的外掛資料夾或 .zip（以分號分隔；找不到就略過）
+    team_plugin_dirs: str = ""
+    # Decision-1 派工：分數 = 適合度 − 成本權重 × 相對成本
+    team_cost_weight: float = 0.3
+    # 對話用量達到這個比例 → 存檔、開新對話
+    team_context_rollover: float = 0.70
+    # 舊助理工作文件相對路徑（分號分隔；發現就從 worktree 移除）
+    team_legacy_doc_dirs: str = "docs/ai-team"
+    # 額外要連結進 worktree 的 git 外資料目錄（分號分隔）
+    team_env_dirs: str = ""
 
     @classmethod
     def load(cls, path: str = DEFAULT_CONFIG_PATH) -> "AppConfig":
@@ -169,6 +213,16 @@ class AppConfig:
             cfg.mode = "ai"
         if cfg.basic_mode not in ("image", "uia"):
             cfg.basic_mode = "uia"
+        if cfg.autonomy_level not in AUTONOMY_PRESETS and cfg.autonomy_level != "custom":
+            cfg.autonomy_level = "balanced"
+        # 多 CLI 辦公室：超出範圍（或 NaN）回到預設
+        if not 1 <= cfg.team_max_running <= 16:
+            cfg.team_max_running = 4.0
+        cfg.team_max_running = float(int(cfg.team_max_running))
+        if not 0.0 <= cfg.team_cost_weight <= 1.0:
+            cfg.team_cost_weight = 0.3
+        if not 0.3 <= cfg.team_context_rollover <= 0.95:
+            cfg.team_context_rollover = 0.70
         # 改版拿掉的舊預設規則：一般 git push 改為可以自動（使用者 2026-11-16 決定）
         cfg.deny_patterns = [p for p in cfg.deny_patterns if p not in _RETIRED_DENY_PATTERNS]
         # 舊設定檔沒有的新規則補上（使用者自己加的規則不動）
@@ -176,6 +230,26 @@ class AppConfig:
             if p not in cfg.deny_patterns:
                 cfg.deny_patterns.append(p)
         return cfg
+
+    def team_plugin_list(self) -> List[str]:
+        return [p.strip() for p in (self.team_plugin_dirs or "").split(";") if p.strip()]
+
+    def team_legacy_doc_list(self) -> List[str]:
+        vals = [p.strip() for p in (self.team_legacy_doc_dirs or "").split(";") if p.strip()]
+        return vals or ["docs/ai-team"]
+
+    def team_env_dir_list(self) -> List[str]:
+        return [p.strip() for p in (self.team_env_dirs or "").split(";") if p.strip()]
+
+    def apply_autonomy(self, level: str) -> bool:
+        """套用自主程度預設值；不認得的程度回傳 False、不改任何設定。"""
+        preset = AUTONOMY_PRESETS.get(level)
+        if preset is None:
+            return False
+        for k, v in preset["values"].items():
+            setattr(self, k, v)
+        self.autonomy_level = level
+        return True
 
     def is_authorized(self, key: str) -> bool:
         return key in self.authorized_sessions

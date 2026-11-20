@@ -108,6 +108,10 @@ class DecisionClient:
 
     def systemone(self, state: str, questions: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         """回傳 answers 字典：answers[<名稱>] 內含 noul 機率或 choice/confidence/probabilities。"""
+        return self.systemone_meta(state, questions)[0]
+
+    def systemone_meta(self, state: str, questions: Dict[str, Dict[str, Any]]) -> "tuple":
+        """同 systemone，另回傳 meta：{"model": 伺服器回報的模型名（有才放）, "usage": 回應的 usage（有才放）}。"""
         if not self.base_url or not self.api_key:
             raise AIError("Decision-1 尚未設定 Base URL 或金鑰")
         count_call(self.model)
@@ -129,7 +133,13 @@ class DecisionClient:
             raise AIError(f"Decision-1 回應格式錯誤：{r.text[:200]}") from e
         if not isinstance(answers, dict):
             raise AIError("Decision-1 回應格式錯誤：answers 不是物件")
-        return answers
+        data = r.json()
+        meta: Dict[str, Any] = {}
+        if isinstance(data.get("model"), str) and data["model"].strip():
+            meta["model"] = data["model"].strip()
+        if isinstance(data.get("usage"), dict):
+            meta["usage"] = data["usage"]
+        return answers, meta
 
 
 def build_llm_decision_prompt(state: str, questions: Dict[str, Dict[str, Any]]) -> str:
@@ -166,6 +176,8 @@ def _clamp01(v: Any) -> Optional[float]:
     try:
         f = float(v)
     except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
         return None
     return max(0.0, min(1.0, f))
 
